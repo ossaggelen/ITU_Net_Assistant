@@ -1,0 +1,13 @@
+# Dağıtım ve paketleme dosyaları (Build/Binary)
+ITUNetAssistant.exe
+dist/
+build/
+*.spec
+
+# Yerel ayarlar ve loglar
+settings.json
+*.log
+
+# Python geçici dosyaları
+__pycache__/
+*.pyc
