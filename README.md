@@ -1,6 +1,6 @@
 #  ITU Net Assistant - Ultimate Dashboard
 
-İTÜ Gölet Yurtları (ITU Pond Dormitories) gibi ağ bağlantısının sık koptuğu ortamlarda, internet bağlantısını otomatik olarak onaran ve Windows Hotspot'u aktif tutan gelişmiş bir masaüstü aracıdır. 
+İTÜ Gölet Yurtları (ITU Pond Dormitories) gibi ağ bağlantısının sık koptuğu ortamlarda, internet bağlantısını otomatik olarak onaran ve Windows Hotspot'u sürekli aktif tutabilen gelişmiş bir masaüstü aracıdır. 
 
 ##  Öne Çıkan Özellikler (Features)
 
