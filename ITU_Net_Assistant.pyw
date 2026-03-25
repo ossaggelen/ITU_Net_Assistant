@@ -235,27 +235,34 @@ class NetworkWorker:
             return
         self._hotspot_last_check = now
 
-        # StartTetheringAsync().AsTask().Wait() ile async sonucu bekle
-        ps_script = """
-        $tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,
-               Windows.Networking.NetworkOperators,
-               ContentType = WindowsRuntime]::CreateFromConnectionProfile(
-                 [Windows.Networking.Connectivity.NetworkInformation,
-                  Windows.Networking.Connectivity,
-                  ContentType = WindowsRuntime]::GetInternetConnectionProfile())
-        if ($tm -and $tm.TetheringOperationalState -eq 'Off') {
-            $tm.StartTetheringAsync().AsTask().Wait(5000) | Out-Null
-            Write-Output 'STARTED'
-        }
-        """
+        # FIX: Multi-line string ayrıştırma sorununu çözmek için Single-Line yapıldı.
+        ps_script = (
+            "$cp = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType = WindowsRuntime]::GetInternetConnectionProfile(); "
+            "if ($cp) { "
+            "$tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType = WindowsRuntime]::CreateFromConnectionProfile($cp); "
+            "if ($tm -and $tm.TetheringOperationalState -eq 'Off') { "
+            "$tm.StartTetheringAsync().AsTask().Wait(5000) | Out-Null; "
+            "Write-Output 'STARTED' "
+            "} "
+            "} else { Write-Error 'No_Internet_Profile' }"
+        )
+
         try:
+            # -WindowStyle Hidden ekleyerek arkaplanda tamamen görünmez yaptık
             result = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
-                capture_output=True, text=True, timeout=10,
+                ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps_script],
+                capture_output=True, text=True, timeout=12,
                 creationflags=0x08000000
             )
+            
             if "STARTED" in result.stdout:
                 logging.info("Hotspot was OFF -> automatically STARTED.")
+            elif "No_Internet_Profile" in result.stderr:
+                logging.warning("Hotspot trigger skipped: Windows has not yet fully recognized the internet profile (NCSI pending).")
+            elif result.stderr.strip():
+                # Beklenmedik bir PowerShell hatası varsa log'a düşecek
+                logging.error(f"PowerShell Error: {result.stderr.strip()}")
+                
         except (subprocess.TimeoutExpired, OSError) as e:
             logging.warning(f"Hotspot management failed: {e}")
 
