@@ -4,7 +4,7 @@
 
 ##  Öne Çıkan Özellikler (Features)
 
-* **Akıllı İzleme (Smart Monitoring):** İnternet bağlantısını Port 80 üzerinden kontrol ederek firewall engellerini aşar (Port 80 Bypass). 
+* **Smart Polling (Aktif Yoklama):** Windows NCSI mantığıyla çalışarak IP düşmese bile dış ağa (Port 80) ping atarak gerçek internet erişimini kontrol eder.
 * **Otomatik Onarım (Auto-Repair):** Bağlantı koptuğunda Ethernet adaptörünü otomatik olarak resetler (Adapter Reset). 
 * **Hotspot Otomasyonu:** İnternet geldikten sonra Windows Hotspot'u PowerShell/Windows Runtime API üzerinden otomatik olarak açar. 
 * **Sessiz Başlangıç (Silent Startup):** Windows Görev Zamanlayıcı (Task Scheduler) entegrasyonu ile bilgisayar açıldığında kullanıcıya sormadan arka planda başlar. 
@@ -26,8 +26,8 @@ Projeyi yerel makinenizde çalıştırmak için:
 
 1. Depoyu Klonlayın (Clone the Repository):
    ```bash
-    git clone https://github.com/ossaggelen/ITU-Net-Assistant.git
-    cd ITU-Net-Assistant
+    git clone https://github.com/ossaggelen/ITU_Net_Assistant
+    cd ITU_Net_Assistant
     ```
 
 2. Gereksinimleri Yükleyin (Install Dependencies):
