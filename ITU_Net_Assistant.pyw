@@ -32,8 +32,29 @@ if getattr(sys, 'frozen', False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 
-ICON_PATH     = os.path.join(BASE_DIR, "icon.png")
-ICON_ICO_PATH = os.path.join(BASE_DIR, "icon.ico")
+def find_asset(filename):
+    """
+    Asset dosyalarini sirasiyla:
+    1. PyInstaller onefile temp dizininde (sys._MEIPASS)
+    2. Exe'nin veya script'in calistigi klasorde (BASE_DIR)
+    3. Exe dist klasorundeyse bir ust proje klasorunde (os.path.dirname(BASE_DIR))
+    arar.
+    """
+    candidates = []
+    if hasattr(sys, '_MEIPASS'):
+        candidates.append(sys._MEIPASS)
+    candidates.append(BASE_DIR)
+    candidates.append(os.path.dirname(BASE_DIR))
+
+    for d in candidates:
+        if d:
+            path = os.path.join(d, filename)
+            if os.path.exists(path):
+                return os.path.abspath(path)
+    return os.path.join(BASE_DIR, filename)
+
+ICON_PATH     = find_asset("icon.png")
+ICON_ICO_PATH = find_asset("icon.ico")
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 LOG_PATH      = os.path.join(BASE_DIR, "ITU_Net_Assistant.log")
 
@@ -639,14 +660,14 @@ class ITUApp:
         self.window.focus_force()
 
     def load_raw_assets(self):
-        if os.path.exists(ICON_PATH):
-            try:
-                # context manager: PIL dosya handle'ini sizdirmaz
-                with Image.open(ICON_PATH) as pil_img:
-                    self.tray_img = pil_img.resize((64, 64), Image.Resampling.LANCZOS)
-                return
-            except (OSError, Exception):
-                pass
+        for path in [find_asset("icon.png"), find_asset("icon.ico")]:
+            if path and os.path.exists(path):
+                try:
+                    with Image.open(path) as pil_img:
+                        self.tray_img = pil_img.resize((64, 64), Image.Resampling.LANCZOS)
+                    return
+                except (OSError, Exception):
+                    pass
         self._fallback_tray_img()
 
     def _fallback_tray_img(self):
