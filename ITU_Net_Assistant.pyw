@@ -45,6 +45,7 @@ class Status(Enum):
     INITIALIZING = "Initializing..."
     ACTIVE       = "Active"
     PASSIVE      = "Passive"
+    PASSIVE_WIFI = "Passive (Wi-Fi)"
     RESETTING    = "Resetting..."
     PAUSED       = "Paused"
 
@@ -81,6 +82,47 @@ if not is_admin():
         None, "runas", sys.executable, " ".join(sys.argv), None, 0
     )
     sys.exit()
+
+# ==============================================================================
+# 4.1 HOTSPOT REGISTRY & ADVAPI32 DEFINITIONS
+# ==============================================================================
+def configure_hotspot_registry():
+    """Windows'un cihaz bagli degilken hotspot'u otomatik kapatmasini onler."""
+    try:
+        import winreg
+        key_path = r"SYSTEM\CurrentControlSet\Services\icssvc\Settings"
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, "PeerlessTimeoutEnabled", 0, winreg.REG_DWORD, 0)
+    except Exception:
+        pass
+
+configure_hotspot_registry()
+
+try:
+    from ctypes import wintypes
+    _advapi32 = ctypes.windll.advapi32
+    _advapi32.OpenSCManagerW.restype = wintypes.HANDLE
+    _advapi32.OpenSCManagerW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+    _advapi32.OpenServiceW.restype = wintypes.HANDLE
+    _advapi32.OpenServiceW.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR, wintypes.DWORD]
+    _advapi32.CloseServiceHandle.restype = wintypes.BOOL
+    _advapi32.CloseServiceHandle.argtypes = [wintypes.HANDLE]
+
+    class _SERVICE_STATUS(ctypes.Structure):
+        _fields_ = [
+            ("dwServiceType", wintypes.DWORD),
+            ("dwCurrentState", wintypes.DWORD),
+            ("dwControlsAccepted", wintypes.DWORD),
+            ("dwWin32ExitCode", wintypes.DWORD),
+            ("dwServiceSpecificExitCode", wintypes.DWORD),
+            ("dwCheckPoint", wintypes.DWORD),
+            ("dwWaitHint", wintypes.DWORD),
+        ]
+
+    _advapi32.QueryServiceStatus.restype = wintypes.BOOL
+    _advapi32.QueryServiceStatus.argtypes = [wintypes.HANDLE, ctypes.POINTER(_SERVICE_STATUS)]
+except Exception:
+    _advapi32 = None
 
 # ==============================================================================
 # 5. CONFIG
@@ -131,7 +173,8 @@ class NetworkWorker:
         self._active.set()
 
         # Non-blocking acquire ile TOCTOU race condition'i onluyoruz
-        self._reset_lock = threading.Lock()
+        self._reset_lock   = threading.Lock()
+        self._hotspot_lock = threading.Lock()
 
         self._status      = Status.INITIALIZING
         self._status_lock = threading.Lock()
@@ -228,43 +271,170 @@ class NetworkWorker:
         """
         return self._run_checks()
 
+    def is_wifi_connected(self):
+        """Herhangi bir Wi-Fi arabiriminin bir ağa bağlı olup olmadığını wlanapi.dll ile sorgular."""
+        try:
+            from ctypes import wintypes
+            wlanapi = ctypes.windll.wlanapi
+            
+            dwClientVersion = ctypes.c_ulong(2)
+            pdwNegotiatedVersion = ctypes.c_ulong()
+            hClientHandle = wintypes.HANDLE()
+            
+            ret = wlanapi.WlanOpenHandle(dwClientVersion, None, ctypes.byref(pdwNegotiatedVersion), ctypes.byref(hClientHandle))
+            if ret != 0:
+                return False
+                
+            try:
+                pInterfaceList = ctypes.c_void_p()
+                ret = wlanapi.WlanEnumInterfaces(hClientHandle, None, ctypes.byref(pInterfaceList))
+                if ret != 0:
+                    return False
+                    
+                try:
+                    pInterfaceListValue = pInterfaceList.value
+                    if not pInterfaceListValue:
+                        return False
+                    
+                    class GUID(ctypes.Structure):
+                        _fields_ = [
+                            ("Data1", ctypes.c_ulong),
+                            ("Data2", ctypes.c_ushort),
+                            ("Data3", ctypes.c_ushort),
+                            ("Data4", ctypes.c_ubyte * 8),
+                        ]
+
+                    class WLAN_INTERFACE_INFO(ctypes.Structure):
+                        _fields_ = [
+                            ("InterfaceGuid", GUID),
+                            ("InterfaceDescription", ctypes.c_wchar * 256),
+                            ("isState", ctypes.c_uint),
+                        ]
+
+                    class WLAN_INTERFACE_INFO_LIST_HEADER(ctypes.Structure):
+                        _fields_ = [
+                            ("NumberOfItems", ctypes.c_ulong),
+                            ("Index", ctypes.c_ulong),
+                        ]
+                    
+                    header = WLAN_INTERFACE_INFO_LIST_HEADER.from_address(pInterfaceListValue)
+                    num_items = header.NumberOfItems
+                    
+                    class WLAN_INTERFACE_INFO_LIST_ACTUAL(ctypes.Structure):
+                        _fields_ = [
+                            ("NumberOfItems", ctypes.c_ulong),
+                            ("Index", ctypes.c_ulong),
+                            ("InterfaceInfo", WLAN_INTERFACE_INFO * num_items),
+                        ]
+                    
+                    actual_list = WLAN_INTERFACE_INFO_LIST_ACTUAL.from_address(pInterfaceListValue)
+                    for i in range(num_items):
+                        info = actual_list.InterfaceInfo[i]
+                        # State 1: wlan_interface_state_connected
+                        if info.isState == 1:
+                            return True
+                finally:
+                    if pInterfaceList:
+                        wlanapi.WlanFreeMemory(pInterfaceList)
+            finally:
+                wlanapi.WlanCloseHandle(hClientHandle, None)
+        except Exception as e:
+            logging.error(f"Wi-Fi connection check error: {e}")
+        return False
+
     # --- Hotspot Yonetimi ---
-    def manage_hotspot(self):
+    def is_hotspot_active(self):
+        """
+        Hotspot'un aktif olup olmadigini Windows Mobile Hotspot Service (icssvc)
+        durumundan 0.05 ms'de, hicbir process spawn etmeden ve CPU harcamadan sorgular.
+        """
+        if not _advapi32:
+            return False
+        try:
+            scm = _advapi32.OpenSCManagerW(None, None, 0x0001)  # SC_MANAGER_CONNECT
+            if not scm:
+                return False
+            try:
+                svc = _advapi32.OpenServiceW(scm, "icssvc", 0x0004)  # SERVICE_QUERY_STATUS
+                if not svc:
+                    return False
+                try:
+                    status = _SERVICE_STATUS()
+                    if _advapi32.QueryServiceStatus(svc, ctypes.byref(status)):
+                        # 2: SERVICE_START_PENDING, 4: SERVICE_RUNNING
+                        return status.dwCurrentState in (2, 4)
+                finally:
+                    _advapi32.CloseServiceHandle(svc)
+            finally:
+                _advapi32.CloseServiceHandle(scm)
+        except Exception as e:
+            logging.debug(f"Hotspot status check error: {e}")
+        return False
+
+    def manage_hotspot(self, force=False):
+        # 1. Zero-Cost Pre-Check: Hotspot zaten aciksa PowerShell'e HIC DOKUNMA
+        if not force and self.is_hotspot_active():
+            return
+
+        # 2. Hotspot kapaliysa: Arka arkaya gereksiz calismayi onlemek icin throttle
         now = time.time()
-        if now - self._hotspot_last_check < self.HOTSPOT_CHECK_INTERVAL:
+        if not force and (now - self._hotspot_last_check < self.HOTSPOT_CHECK_INTERVAL):
             return
         self._hotspot_last_check = now
 
-        # FIX: Multi-line string ayrıştırma sorununu çözmek için Single-Line yapıldı.
-        ps_script = (
-            "$cp = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType = WindowsRuntime]::GetInternetConnectionProfile(); "
-            "if ($cp) { "
-            "$tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType = WindowsRuntime]::CreateFromConnectionProfile($cp); "
-            "if ($tm -and $tm.TetheringOperationalState -eq 'Off') { "
-            "$tm.StartTetheringAsync().AsTask().Wait(5000) | Out-Null; "
-            "Write-Output 'STARTED' "
-            "} "
-            "} else { Write-Error 'No_Internet_Profile' }"
-        )
+        # Non-blocking acquire: Ayni anda iki hotspot tetikleme thread'i calismasin
+        if not self._hotspot_lock.acquire(blocking=False):
+            return
 
-        try:
-            # -WindowStyle Hidden ekleyerek arkaplanda tamamen görünmez yaptık
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps_script],
-                capture_output=True, text=True, timeout=12,
-                creationflags=0x08000000
-            )
-            
-            if "STARTED" in result.stdout:
-                logging.info("Hotspot was OFF -> automatically STARTED.")
-            elif "No_Internet_Profile" in result.stderr:
-                logging.warning("Hotspot trigger skipped: Windows has not yet fully recognized the internet profile (NCSI pending).")
-            elif result.stderr.strip():
-                # Beklenmedik bir PowerShell hatası varsa log'a düşecek
-                logging.error(f"PowerShell Error: {result.stderr.strip()}")
-                
-        except (subprocess.TimeoutExpired, OSError) as e:
-            logging.warning(f"Hotspot management failed: {e}")
+        def _worker():
+            try:
+                ps_script = (
+                    "$cp = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType = WindowsRuntime]::GetInternetConnectionProfile(); "
+                    "if ($cp) { "
+                    "$tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType = WindowsRuntime]::CreateFromConnectionProfile($cp); "
+                    "if ($tm -and $tm.TetheringOperationalState -eq 'Off') { "
+                    "$tm.StartTetheringAsync().AsTask().Wait(5000) | Out-Null; "
+                    "Write-Output 'STARTED' "
+                    "} "
+                    "} else { Write-Error 'No_Internet_Profile' }"
+                )
+
+                # %100 Sessiz Calisma: STARTUPINFO ile konsol/terminal penceresini gizle
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = 0  # SW_HIDE
+
+                result = subprocess.run(
+                    [
+                        "powershell",
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy", "Bypass",
+                        "-WindowStyle", "Hidden",
+                        "-Command", ps_script,
+                    ],
+                    startupinfo=startupinfo,
+                    capture_output=True,
+                    text=True,
+                    timeout=12,
+                    creationflags=0x08000000,  # CREATE_NO_WINDOW
+                )
+
+                if "STARTED" in result.stdout:
+                    logging.info("Hotspot was OFF -> automatically STARTED.")
+                elif "No_Internet_Profile" in result.stderr:
+                    logging.warning("Hotspot trigger skipped: Windows has not yet fully recognized the internet profile (NCSI pending).")
+                elif result.stderr.strip():
+                    logging.error(f"PowerShell Error: {result.stderr.strip()}")
+
+            except (subprocess.TimeoutExpired, OSError) as e:
+                logging.warning(f"Hotspot management failed: {e}")
+            finally:
+                self._hotspot_lock.release()
+
+        # Izleme dongusunu bekletmemek icin PowerShell'i ayri arka plan thread'inde calistir
+        threading.Thread(target=_worker, daemon=True).start()
 
     # --- Adaptor Reset ---
     def reset_adapter_logic(self, is_manual=False):
@@ -309,7 +479,7 @@ class NetworkWorker:
                 logging.warning("DHCP timeout (25s). Main loop will retry.")
 
             self._hotspot_last_check = 0.0  # Reset sonrasi hotspot hemen kontrol edilsin
-            self.manage_hotspot()
+            self.manage_hotspot(force=True)
         finally:
             self._reset_lock.release()
 
@@ -325,18 +495,31 @@ class NetworkWorker:
         logging.info("=== MONITORING STARTED ===")
         time.sleep(self.config.data["startup_delay"])
 
+        wifi_logged = False
+
         while self._running.is_set():
             if self._active.is_set():
-                if not self._reset_lock.locked():
-                    if not self.is_connected():
-                        logging.warning("No connection -> starting reset...")
-                        threading.Thread(
-                            target=self.reset_adapter_logic, daemon=True
-                        ).start()
-                    else:
-                        self.manage_hotspot()
+                if self.is_wifi_connected():
+                    if not wifi_logged:
+                        logging.info("Wi-Fi connection detected. Suspending auto-hotspot and auto-reset.")
+                        wifi_logged = True
+                    self.status = Status.PASSIVE_WIFI
+                else:
+                    if wifi_logged:
+                        logging.info("Wi-Fi connection disconnected. Resuming cabled monitoring.")
+                        wifi_logged = False
+                    
+                    if not self._reset_lock.locked():
+                        if not self.is_connected():
+                            logging.warning("No connection -> starting reset...")
+                            threading.Thread(
+                                target=self.reset_adapter_logic, daemon=True
+                            ).start()
+                        else:
+                            self.manage_hotspot()
             else:
                 self.status = Status.PAUSED
+                wifi_logged = False
 
             # time.sleep() yerine Event.wait():
             # exit_app() _running'i clear edince sleep bitmesini beklemez,
@@ -520,6 +703,7 @@ class ITUApp:
             Status.ACTIVE      : "green",
             Status.RESETTING   : "orange",
             Status.PASSIVE     : "gray",
+            Status.PASSIVE_WIFI: "#3a7ebf",
             Status.PAUSED      : "gray",
             Status.INITIALIZING: "white",
         }
