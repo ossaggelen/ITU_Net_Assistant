@@ -45,7 +45,7 @@ class Status(Enum):
     INITIALIZING = "Initializing..."
     ACTIVE       = "Active"
     PASSIVE      = "Passive"
-    PASSIVE_WIFI = "Passive (Wi-Fi)"
+    NO_CABLE     = "Passive (No Cable)"
     RESETTING    = "Resetting..."
     PAUSED       = "Paused"
 
@@ -125,6 +125,61 @@ except Exception:
     _advapi32 = None
 
 # ==============================================================================
+# 4.2 WINDOWS NETWORK IPHLPAPI DEFINITIONS (ETHERNET LINK & IP STATUS)
+# ==============================================================================
+try:
+    _iphlpapi = ctypes.windll.iphlpapi
+
+    class _SOCKET_ADDRESS(ctypes.Structure):
+        _fields_ = [
+            ("lpSockaddr", ctypes.c_void_p),
+            ("iSockaddrLength", ctypes.c_int),
+        ]
+
+    class _IP_ADAPTER_UNICAST_ADDRESS(ctypes.Structure):
+        pass
+
+    _IP_ADAPTER_UNICAST_ADDRESS._fields_ = [
+        ("Length", wintypes.ULONG),
+        ("Flags", wintypes.DWORD),
+        ("Next", ctypes.POINTER(_IP_ADAPTER_UNICAST_ADDRESS)),
+        ("Address", _SOCKET_ADDRESS),
+    ]
+
+    class _IP_ADAPTER_ADDRESSES(ctypes.Structure):
+        pass
+
+    _IP_ADAPTER_ADDRESSES._fields_ = [
+        ("Length", wintypes.ULONG),
+        ("IfIndex", wintypes.DWORD),
+        ("Next", ctypes.POINTER(_IP_ADAPTER_ADDRESSES)),
+        ("AdapterName", ctypes.c_char_p),
+        ("FirstUnicastAddress", ctypes.POINTER(_IP_ADAPTER_UNICAST_ADDRESS)),
+        ("FirstAnycastAddress", ctypes.c_void_p),
+        ("FirstMulticastAddress", ctypes.c_void_p),
+        ("FirstDnsServerAddress", ctypes.c_void_p),
+        ("DnsSuffix", wintypes.LPWSTR),
+        ("Description", wintypes.LPWSTR),
+        ("FriendlyName", wintypes.LPWSTR),
+        ("PhysicalAddress", ctypes.c_ubyte * 8),
+        ("PhysicalAddressLength", wintypes.DWORD),
+        ("Flags", wintypes.DWORD),
+        ("Mtu", wintypes.DWORD),
+        ("IfType", wintypes.DWORD),
+        ("OperStatus", wintypes.DWORD),
+    ]
+
+    class _SOCKADDR_IN(ctypes.Structure):
+        _fields_ = [
+            ("sin_family", ctypes.c_short),
+            ("sin_port", ctypes.c_ushort),
+            ("sin_addr", ctypes.c_ubyte * 4),
+            ("sin_zero", ctypes.c_char * 8),
+        ]
+except Exception:
+    _iphlpapi = None
+
+# ==============================================================================
 # 5. CONFIG
 # ==============================================================================
 class Config:
@@ -132,7 +187,7 @@ class Config:
         self.defaults = {
             "adapter_name"  : "Ethernet",
             "check_interval": 5,
-            "startup_delay" : 5,
+            "startup_delay" : 15,
             "log_max_mb"    : 5,
             "auto_start"    : True,
         }
@@ -228,13 +283,61 @@ class NetworkWorker:
         root.addHandler(handler)
         root.setLevel(logging.INFO)
 
-    # --- Baglanti Kontrolu ---
-    def _socket_check(self, ip, results, lock):
+    # --- Adaptor Durum ve Baglanti Kontrolu ---
+    def get_adapter_info(self, adapter_name=None):
+        """
+        Istenen adaptorun durumunu (OperStatus: 1=Up, digerleri=Down) ve
+        IPv4 adresini Win32 GetAdaptersAddresses ile 0.1 ms'de dondurur.
+        Donus: (is_up: bool, ip_address: str | None)
+        """
+        if not adapter_name:
+            adapter_name = self.config.data["adapter_name"]
+
+        if not _iphlpapi:
+            return True, None
+
+        try:
+            buflen = wintypes.ULONG(16384)
+            buf    = ctypes.create_string_buffer(16384)
+            # AF_INET = 2, Flags = 14 (SKIP_ANYCAST | SKIP_MULTICAST | SKIP_DNS_SERVER)
+            ret = _iphlpapi.GetAdaptersAddresses(2, 14, None, ctypes.byref(buf), ctypes.byref(buflen))
+            if ret != 0:
+                return False, None
+
+            curr = ctypes.cast(buf, ctypes.POINTER(_IP_ADAPTER_ADDRESSES))
+            while curr:
+                a = curr.contents
+                if a.FriendlyName and a.FriendlyName.lower() == adapter_name.lower():
+                    is_up  = (a.OperStatus == 1)
+                    ip_str = None
+                    u = a.FirstUnicastAddress
+                    while u:
+                        sa_ptr = u.contents.Address.lpSockaddr
+                        if sa_ptr:
+                            sa = _SOCKADDR_IN.from_address(sa_ptr)
+                            if sa.sin_family == 2:  # AF_INET
+                                parsed_ip = socket.inet_ntoa(bytes(sa.sin_addr))
+                                if not parsed_ip.startswith("169.254."):
+                                    ip_str = parsed_ip
+                                    break
+                        u = u.contents.Next
+                    return is_up, ip_str
+                curr = a.Next
+        except Exception as e:
+            logging.debug(f"Adapter info query error: {e}")
+        return False, None
+
+    def _socket_check(self, ip, port, bind_ip, results, lock):
         # Per-socket timeout: global setdefaulttimeout() tum thread'leri etkiler
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(2)
-            s.connect((ip, 80))
+            if bind_ip:
+                try:
+                    s.bind((bind_ip, 0))
+                except OSError:
+                    pass
+            s.connect((ip, port))
             s.close()
             with lock:
                 results.append(True)
@@ -242,105 +345,42 @@ class NetworkWorker:
             with lock:
                 results.append(False)
 
-    def _run_checks(self):
-        """Iki IP'ye paralel socket baglantisi dener. Ham bool doner."""
+    def _run_checks(self, bind_ip=None):
+        """
+        Guvenilir 3 hedefe (Cloudflare HTTP, Cloudflare Secondary, Google DNS TCP)
+        Ethernet IP'sine bagli socket ile paralel baglanti dener.
+        """
         results = []
         lock    = threading.Lock()
+        targets = [
+            ("1.1.1.1", 80),
+            ("1.0.0.1", 80),
+            ("8.8.8.8", 53),
+        ]
         threads = [
             threading.Thread(
-                target=self._socket_check, args=(ip, results, lock), daemon=True
+                target=self._socket_check, args=(ip, port, bind_ip, results, lock), daemon=True
             )
-            for ip in ["8.8.8.8", "1.1.1.1"]
+            for ip, port in targets
         ]
         for t in threads: t.start()
-        for t in threads: t.join(timeout=4)
+        for t in threads: t.join(timeout=3)
         return any(results)
 
-    def is_connected(self):
+    def is_connected(self, bind_ip=None):
         """Baglantiyi kontrol eder ve status'u gunceller."""
-        connected = self._run_checks()
+        connected = self._run_checks(bind_ip=bind_ip)
         self.status = Status.ACTIVE if connected else Status.PASSIVE
         return connected
 
-    def _raw_check(self):
+    def _raw_check(self, bind_ip=None):
         """
         Status'a DOKUNMADAN baglantiyi kontrol eder.
         reset_adapter_logic icindeki DHCP polling'de kullanilir:
         reset surecinde status "Resetting..." sabit kalmali;
         is_connected() bunu "Passive"/"Active" yapip UI'da flicker'a yol acardi.
         """
-        return self._run_checks()
-
-    def is_wifi_connected(self):
-        """Herhangi bir Wi-Fi arabiriminin bir ağa bağlı olup olmadığını wlanapi.dll ile sorgular."""
-        try:
-            from ctypes import wintypes
-            wlanapi = ctypes.windll.wlanapi
-            
-            dwClientVersion = ctypes.c_ulong(2)
-            pdwNegotiatedVersion = ctypes.c_ulong()
-            hClientHandle = wintypes.HANDLE()
-            
-            ret = wlanapi.WlanOpenHandle(dwClientVersion, None, ctypes.byref(pdwNegotiatedVersion), ctypes.byref(hClientHandle))
-            if ret != 0:
-                return False
-                
-            try:
-                pInterfaceList = ctypes.c_void_p()
-                ret = wlanapi.WlanEnumInterfaces(hClientHandle, None, ctypes.byref(pInterfaceList))
-                if ret != 0:
-                    return False
-                    
-                try:
-                    pInterfaceListValue = pInterfaceList.value
-                    if not pInterfaceListValue:
-                        return False
-                    
-                    class GUID(ctypes.Structure):
-                        _fields_ = [
-                            ("Data1", ctypes.c_ulong),
-                            ("Data2", ctypes.c_ushort),
-                            ("Data3", ctypes.c_ushort),
-                            ("Data4", ctypes.c_ubyte * 8),
-                        ]
-
-                    class WLAN_INTERFACE_INFO(ctypes.Structure):
-                        _fields_ = [
-                            ("InterfaceGuid", GUID),
-                            ("InterfaceDescription", ctypes.c_wchar * 256),
-                            ("isState", ctypes.c_uint),
-                        ]
-
-                    class WLAN_INTERFACE_INFO_LIST_HEADER(ctypes.Structure):
-                        _fields_ = [
-                            ("NumberOfItems", ctypes.c_ulong),
-                            ("Index", ctypes.c_ulong),
-                        ]
-                    
-                    header = WLAN_INTERFACE_INFO_LIST_HEADER.from_address(pInterfaceListValue)
-                    num_items = header.NumberOfItems
-                    
-                    class WLAN_INTERFACE_INFO_LIST_ACTUAL(ctypes.Structure):
-                        _fields_ = [
-                            ("NumberOfItems", ctypes.c_ulong),
-                            ("Index", ctypes.c_ulong),
-                            ("InterfaceInfo", WLAN_INTERFACE_INFO * num_items),
-                        ]
-                    
-                    actual_list = WLAN_INTERFACE_INFO_LIST_ACTUAL.from_address(pInterfaceListValue)
-                    for i in range(num_items):
-                        info = actual_list.InterfaceInfo[i]
-                        # State 1: wlan_interface_state_connected
-                        if info.isState == 1:
-                            return True
-                finally:
-                    if pInterfaceList:
-                        wlanapi.WlanFreeMemory(pInterfaceList)
-            finally:
-                wlanapi.WlanCloseHandle(hClientHandle, None)
-        except Exception as e:
-            logging.error(f"Wi-Fi connection check error: {e}")
-        return False
+        return self._run_checks(bind_ip=bind_ip)
 
     # --- Hotspot Yonetimi ---
     def is_hotspot_active(self):
@@ -442,15 +482,26 @@ class NetworkWorker:
         if not self._reset_lock.acquire(blocking=False):
             return
         try:
-            # Manuel degilse 1.5s bekle; gecici kopuklukta gereksiz reset atmamak icin
+            adapter = self.config.data["adapter_name"]
+
+            # Manuel degilse 1.5s bekle; kablo durumunu ve gecici kopuklugu teyit et
             if not is_manual:
+                is_up, bind_ip = self.get_adapter_info(adapter)
+                if not is_up:
+                    logging.info(f"Reset cancelled: '{adapter}' cable is unplugged.")
+                    self.status = Status.NO_CABLE
+                    return
+
                 time.sleep(1.5)
-                if self.is_connected():
+                is_up, bind_ip = self.get_adapter_info(adapter)
+                if not is_up:
+                    self.status = Status.NO_CABLE
+                    return
+                if self._raw_check(bind_ip=bind_ip):
                     return
 
             self.status = Status.RESETTING
-            adapter = self.config.data["adapter_name"]
-            logging.warning(f"Connection lost. Resetting adapter: '{adapter}'")
+            logging.warning(f"Connection lost on '{adapter}'. Resetting adapter...")
 
             # shell=False + liste argumanlari: injection riski yok, path guvenligi var
             subprocess.run(
@@ -471,8 +522,10 @@ class NetworkWorker:
             deadline = time.time() + 25
             while time.time() < deadline:
                 time.sleep(2)
-                if self._raw_check():
-                    logging.info("DHCP acquired. Connection restored.")
+                is_up, bind_ip = self.get_adapter_info(adapter)
+                if is_up and self._raw_check(bind_ip=bind_ip):
+                    logging.info("DHCP acquired. Connection restored on Ethernet.")
+                    self.status = Status.ACTIVE
                     break
             else:
                 # while dongusu break olmadan bittiyse: timeout
@@ -486,32 +539,47 @@ class NetworkWorker:
     # --- Ana Izleme Dongusu ---
     def run(self):
         """
-        Golet'teki asil sorun 'Silent Drop':
-        Yerel IP (10.x.x.x) hic degismeden ITU router'i interneti sessizce keser.
-        Windows link state "Up" kalmaya devam eder; NotifyAddrChange gibi kernel
-        event'leri bu durumu goremez. Tek guvenilir cozum: periyodik olarak
-        disariya (8.8.8.8) dokunup gercek internet erisimini dogrulamak.
+        Sadece bilgisayar Ethernet ile internete bagliyken calisir.
+        Kablo takili degilse reset atmaz, beklemede kalir.
+        Golet'teki 'Silent Drop' sorununu periyodik Ethernet soket testiyle cozer.
         """
         logging.info("=== MONITORING STARTED ===")
-        time.sleep(self.config.data["startup_delay"])
 
-        wifi_logged = False
+        # Akilli baslangic beklemesi:
+        # PC acilisinda Windows'un Ethernet kartini ayaga kaldirip DHCP IP almasi 10s surebiliyor.
+        # Erken gelirse hemen baslar, gelmezse startup_delay suresince sabirla bekler.
+        startup_delay = self.config.data.get("startup_delay", 15)
+        logging.info(f"Waiting for Ethernet initialization (up to {startup_delay}s)...")
+        deadline = time.time() + startup_delay
+        while self._running.is_set() and time.time() < deadline:
+            is_up, eth_ip = self.get_adapter_info()
+            if is_up and eth_ip and self._raw_check(bind_ip=eth_ip):
+                logging.info("Ethernet is ready and connected to internet.")
+                break
+            self._running.wait(1.0)
+
+        cable_unplugged_logged = False
 
         while self._running.is_set():
             if self._active.is_set():
-                if self.is_wifi_connected():
-                    if not wifi_logged:
-                        logging.info("Wi-Fi connection detected. Suspending auto-hotspot and auto-reset.")
-                        wifi_logged = True
-                    self.status = Status.PASSIVE_WIFI
+                adapter = self.config.data["adapter_name"]
+                is_up, eth_ip = self.get_adapter_info(adapter)
+
+                if not is_up:
+                    # ETHERNET KABLOSU TAKILI DEGIL
+                    self.status = Status.NO_CABLE
+                    if not cable_unplugged_logged:
+                        logging.info(f"Ethernet cable unplugged or '{adapter}' is down. Suspending auto-repair and auto-hotspot.")
+                        cable_unplugged_logged = True
                 else:
-                    if wifi_logged:
-                        logging.info("Wi-Fi connection disconnected. Resuming cabled monitoring.")
-                        wifi_logged = False
-                    
+                    # ETHERNET KABLOSU TAKILI
+                    if cable_unplugged_logged:
+                        logging.info(f"Ethernet cable reconnected on '{adapter}'. Resuming monitoring.")
+                        cable_unplugged_logged = False
+
                     if not self._reset_lock.locked():
-                        if not self.is_connected():
-                            logging.warning("No connection -> starting reset...")
+                        if not self.is_connected(bind_ip=eth_ip):
+                            logging.warning("No internet on Ethernet -> starting reset...")
                             threading.Thread(
                                 target=self.reset_adapter_logic, daemon=True
                             ).start()
@@ -519,7 +587,7 @@ class NetworkWorker:
                             self.manage_hotspot()
             else:
                 self.status = Status.PAUSED
-                wifi_logged = False
+                cable_unplugged_logged = False
 
             # time.sleep() yerine Event.wait():
             # exit_app() _running'i clear edince sleep bitmesini beklemez,
@@ -703,7 +771,7 @@ class ITUApp:
             Status.ACTIVE      : "green",
             Status.RESETTING   : "orange",
             Status.PASSIVE     : "gray",
-            Status.PASSIVE_WIFI: "#3a7ebf",
+            Status.NO_CABLE    : "#d19a66",
             Status.PAUSED      : "gray",
             Status.INITIALIZING: "white",
         }
