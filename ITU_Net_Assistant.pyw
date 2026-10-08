@@ -255,7 +255,9 @@ class NetworkWorker:
         self._status      = Status.INITIALIZING
         self._status_lock = threading.Lock()
 
-        self._hotspot_last_check = 0.0
+        self._hotspot_last_check    = 0.0
+        self._hotspot_failures      = 0
+        self._hotspot_backoff_until = 0.0
         self.setup_logging()
 
     # --- Thread-safe property'ler ---
@@ -404,11 +406,37 @@ class NetworkWorker:
         return self._run_checks(bind_ip=bind_ip)
 
     # --- Hotspot Yonetimi ---
+    def has_wifi_hardware(self):
+        """
+        Sistemde calisir durumda (IfType == 71 / 802.11) bir Wi-Fi adaptoru var mi?
+        Wi-Fi karti Kod 10 (CM_PROB_FAILED_START) vermisse veya devre disiysa False doner.
+        """
+        if not _iphlpapi:
+            return True
+        try:
+            buflen = wintypes.ULONG(16384)
+            buf    = ctypes.create_string_buffer(16384)
+            ret    = _iphlpapi.GetAdaptersAddresses(2, 14, None, ctypes.byref(buf), ctypes.byref(buflen))
+            if ret != 0:
+                return False
+            curr = ctypes.cast(buf, ctypes.POINTER(_IP_ADAPTER_ADDRESSES))
+            while curr:
+                a = curr.contents
+                if a.IfType == 71:  # IF_TYPE_IEEE80211
+                    return True
+                curr = a.Next
+        except Exception:
+            pass
+        return False
+
     def is_hotspot_active(self):
         """
         Hotspot'un aktif olup olmadigini Windows Mobile Hotspot Service (icssvc)
         durumundan 0.05 ms'de, hicbir process spawn etmeden ve CPU harcamadan sorgular.
+        Wi-Fi donanimi yoksa veya Kod 10 ile cokmusse dogrudan False doner.
         """
+        if not self.has_wifi_hardware():
+            return False
         if not _advapi32:
             return False
         try:
@@ -433,12 +461,26 @@ class NetworkWorker:
         return False
 
     def manage_hotspot(self, force=False):
-        # 1. Zero-Cost Pre-Check: Hotspot zaten aciksa PowerShell'e HIC DOKUNMA
-        if not force and self.is_hotspot_active():
+        now = time.time()
+
+        # 1. Backoff Korumasi: Art arda hatalarda CPU/PowerShell spamini durdur
+        if now < self._hotspot_backoff_until:
             return
 
-        # 2. Hotspot kapaliysa: Arka arkaya gereksiz calismayi onlemek icin throttle
-        now = time.time()
+        # 2. Wi-Fi Donanim Kontrolu: Wi-Fi karti Kod 10 ile cokmusse veya yoksa PowerShell calistirma
+        if not self.has_wifi_hardware():
+            if self._hotspot_failures == 0:
+                logging.warning("No operational Wi-Fi adapter detected (hardware may be in Code 10 error or disabled). Hotspot skipped.")
+            self._hotspot_failures += 1
+            self._hotspot_backoff_until = now + 60.0  # 1 dakika bekle
+            return
+
+        # 3. Zero-Cost Pre-Check: Hotspot zaten aciksa PowerShell'e HIC DOKUNMA
+        if not force and self.is_hotspot_active():
+            self._hotspot_failures = 0
+            return
+
+        # 4. Throttle kontrolu
         if not force and (now - self._hotspot_last_check < self.HOTSPOT_CHECK_INTERVAL):
             return
         self._hotspot_last_check = now
@@ -484,12 +526,20 @@ class NetworkWorker:
 
                 if "STARTED" in result.stdout:
                     logging.info("Hotspot was OFF -> automatically STARTED.")
+                    self._hotspot_failures = 0
                 elif "No_Internet_Profile" in result.stderr:
                     logging.warning("Hotspot trigger skipped: Windows has not yet fully recognized the internet profile (NCSI pending).")
                 elif result.stderr.strip():
-                    logging.error(f"PowerShell Error: {result.stderr.strip()}")
+                    self._hotspot_failures += 1
+                    err_msg = result.stderr.strip().splitlines()[0] if result.stderr.strip() else ""
+                    if self._hotspot_failures >= 3:
+                        logging.error(f"Hotspot repeatedly failed ({err_msg}). Pausing attempts for 5 minutes.")
+                        self._hotspot_backoff_until = time.time() + 300.0
+                    else:
+                        logging.warning(f"Hotspot trigger warning: {err_msg}")
 
             except (subprocess.TimeoutExpired, OSError) as e:
+                self._hotspot_failures += 1
                 logging.warning(f"Hotspot management failed: {e}")
             finally:
                 self._hotspot_lock.release()
