@@ -1,13 +1,23 @@
-# Dağıtım ve paketleme dosyaları (Build/Binary)
-ITUNetAssistant.exe
+# Dağıtım ve derleme çıktıları (Build/Binary)
+*.exe
 dist/
 build/
-*.spec
+*.msix
+*.appx
 
 # Yerel ayarlar ve loglar
 settings.json
 *.log
 
-# Python geçici dosyaları
+# Python geçici dosyaları ve sanal ortam
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+.env
+
+# IDE / Editör
+.vscode/
+.idea/

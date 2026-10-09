@@ -218,8 +218,20 @@ class Config:
         if os.path.exists(SETTINGS_FILE):
             try:
                 with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                    return {**self.defaults, **json.load(f)}
-            except (json.JSONDecodeError, OSError) as e:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    raise ValueError("Settings must be a JSON object")
+                merged = {**self.defaults, **data}
+                for key in ("check_interval", "startup_delay", "log_max_mb"):
+                    value = merged.get(key)
+                    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                        merged[key] = self.defaults[key]
+                if not isinstance(merged.get("adapter_name"), str) or not merged["adapter_name"].strip():
+                    merged["adapter_name"] = self.defaults["adapter_name"]
+                if not isinstance(merged.get("auto_start"), bool):
+                    merged["auto_start"] = self.defaults["auto_start"]
+                return merged
+            except (json.JSONDecodeError, OSError, ValueError, TypeError) as e:
                 logging.warning(f"Settings load failed, using defaults: {e}")
                 return dict(self.defaults)
         return dict(self.defaults)
@@ -236,8 +248,9 @@ class Config:
 # 6. NETWORK WORKER
 # ==============================================================================
 class NetworkWorker:
-    # Hotspot icin ayri throttle: her check_interval'da powershell spawn etmemek icin
-    HOTSPOT_CHECK_INTERVAL = 30
+    # Hotspot kapatildiginda en gec bir monitor turunda yeniden acmayi dene.
+    HOTSPOT_CHECK_INTERVAL = 5
+    HOTSPOT_RETRY_INTERVAL = 5
 
     def __init__(self, config):
         self.config = config
@@ -245,6 +258,8 @@ class NetworkWorker:
         # threading.Event: bool'dan farkli olarak gercek anlamda thread-safe
         self._running = threading.Event()
         self._running.set()
+        # _running is set during normal work, so waits use a separate stop event.
+        self._stop_event = threading.Event()
         self._active  = threading.Event()
         self._active.set()
 
@@ -285,7 +300,12 @@ class NetworkWorker:
 
     @running.setter
     def running(self, value: bool):
-        self._running.set() if value else self._running.clear()
+        if value:
+            self._stop_event.clear()
+            self._running.set()
+        else:
+            self._running.clear()
+            self._stop_event.set()
 
     # --- Logging ---
     def setup_logging(self):
@@ -352,27 +372,35 @@ class NetworkWorker:
 
     def _socket_check(self, ip, port, bind_ip, results, lock):
         # Per-socket timeout: global setdefaulttimeout() tum thread'leri etkiler
+        s = None
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(2)
             if bind_ip:
-                try:
-                    s.bind((bind_ip, 0))
-                except OSError:
-                    pass
+                s.bind((bind_ip, 0))
             s.connect((ip, port))
-            s.close()
             with lock:
                 results.append(True)
         except OSError:
             with lock:
                 results.append(False)
+        finally:
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
 
     def _run_checks(self, bind_ip=None):
         """
         Guvenilir 3 hedefe (Cloudflare HTTP, Cloudflare Secondary, Google DNS TCP)
         Ethernet IP'sine bagli socket ile paralel baglanti dener.
         """
+        # A check without the selected Ethernet IPv4 would silently use another
+        # route (often Wi-Fi) and could conceal a broken Ethernet connection.
+        if not bind_ip:
+            return False
+
         results = []
         lock    = threading.Lock()
         targets = [
@@ -460,91 +488,126 @@ class NetworkWorker:
             logging.debug(f"Hotspot status check error: {e}")
         return False
 
+    def _hotspot_should_be_active(self):
+        """Check the actual tethering state, not just whether icssvc is running."""
+        ps_script = (
+            "$ErrorActionPreference = 'Stop'; "
+            "$cp = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType = WindowsRuntime]::GetInternetConnectionProfile(); "
+            "if (-not $cp) { Write-Output 'NO_PROFILE'; exit 0 }; "
+            "$tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType = WindowsRuntime]::CreateFromConnectionProfile($cp); "
+            "if (-not $tm) { Write-Output 'NO_MANAGER'; exit 0 }; "
+            "Write-Output $tm.TetheringOperationalState.ToString()"
+        )
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoLogo", "-NoProfile", "-NonInteractive",
+                 "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+                 "-Command", ps_script],
+                startupinfo=startupinfo, capture_output=True, text=True,
+                timeout=8, creationflags=0x08000000,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            logging.warning(f"Could not query Windows hotspot state: {e}")
+            return None
+        if result.returncode != 0:
+            logging.warning(f"Hotspot state query failed: {result.stderr.strip()}")
+            return None
+        state = result.stdout.strip().splitlines()
+        if not state:
+            return None
+        if state[-1] == "On":
+            return True
+        if state[-1] == "Off":
+            return False
+        logging.info(f"Hotspot state unavailable ({state[-1]}).")
+        return None
+
     def manage_hotspot(self, force=False):
         now = time.time()
 
-        # 1. Backoff Korumasi: Art arda hatalarda CPU/PowerShell spamini durdur
-        if now < self._hotspot_backoff_until:
-            return
-
-        # 2. Wi-Fi Donanim Kontrolu: Wi-Fi karti Kod 10 ile cokmusse veya yoksa PowerShell calistirma
+        # The active state is queried through the packaged tethering API. The
+        # icssvc service may remain running even when Mobile Hotspot is Off.
         if not self.has_wifi_hardware():
             if self._hotspot_failures == 0:
                 logging.warning("No operational Wi-Fi adapter detected (hardware may be in Code 10 error or disabled). Hotspot skipped.")
             self._hotspot_failures += 1
-            self._hotspot_backoff_until = now + 60.0  # 1 dakika bekle
+            self._hotspot_backoff_until = now + self.HOTSPOT_RETRY_INTERVAL
             return
 
-        # 3. Zero-Cost Pre-Check: Hotspot zaten aciksa PowerShell'e HIC DOKUNMA
-        if not force and self.is_hotspot_active():
-            self._hotspot_failures = 0
+        # Do not let a previous failure suppress recovery indefinitely: retry
+        # on each normal monitor interval, while still preventing overlap.
+        if now < self._hotspot_backoff_until:
             return
-
-        # 4. Throttle kontrolu
         if not force and (now - self._hotspot_last_check < self.HOTSPOT_CHECK_INTERVAL):
+            return
+        if not self._hotspot_lock.acquire(blocking=False):
             return
         self._hotspot_last_check = now
 
-        # Non-blocking acquire: Ayni anda iki hotspot tetikleme thread'i calismasin
-        if not self._hotspot_lock.acquire(blocking=False):
-            return
-
         def _worker():
             try:
+                state = self._hotspot_should_be_active()
+                if state is True:
+                    self._hotspot_failures = 0
+                    self._hotspot_backoff_until = 0.0
+                    return
+                if state is None:
+                    self._hotspot_failures += 1
+                    self._hotspot_backoff_until = time.time() + self.HOTSPOT_RETRY_INTERVAL
+                    return
+
+                # Off is confirmed by Windows; issue StartTetheringAsync and
+                # wait for its real operation result before declaring success.
                 ps_script = (
+                    "$ErrorActionPreference = 'Stop'; "
                     "$cp = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType = WindowsRuntime]::GetInternetConnectionProfile(); "
-                    "if ($cp) { "
+                    "if (-not $cp) { Write-Output 'NO_PROFILE'; exit 0 }; "
                     "$tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType = WindowsRuntime]::CreateFromConnectionProfile($cp); "
-                    "if ($tm -and $tm.TetheringOperationalState -eq 'Off') { "
-                    "$tm.StartTetheringAsync().AsTask().Wait(5000) | Out-Null; "
-                    "Write-Output 'STARTED' "
-                    "} "
-                    "} else { Write-Error 'No_Internet_Profile' }"
+                    "if ($tm.TetheringOperationalState.ToString() -eq 'On') { Write-Output 'ALREADY_ON'; exit 0 }; "
+                    "Add-Type -AssemblyName System.Runtime.WindowsRuntime; "
+                    "$ext = [System.WindowsRuntimeSystemExtensions]; "
+                    "$asTaskMethod = ($ext.GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]; "
+                    "$op = $tm.StartTetheringAsync(); "
+                    "$asTask = $asTaskMethod.MakeGenericMethod([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult]); "
+                    "$task = $asTask.Invoke($null, @($op)); "
+                    "if (-not $task.Wait(30000)) { throw 'Start_timed_out' }; "
+                    "$result = $task.Result; "
+                    "if ($result.Status.ToString() -eq 'Success') { Write-Output 'STARTED' } "
+                    "else { throw ('Start_failed: ' + $result.Status.ToString() + ' ' + $result.AdditionalErrorMessage) }"
                 )
 
-                # %100 Sessiz Calisma: STARTUPINFO ile konsol/terminal penceresini gizle
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                startupinfo.wShowWindow = 0  # SW_HIDE
-
+                startupinfo.wShowWindow = 0
                 result = subprocess.run(
-                    [
-                        "powershell",
-                        "-NoLogo",
-                        "-NoProfile",
-                        "-NonInteractive",
-                        "-ExecutionPolicy", "Bypass",
-                        "-WindowStyle", "Hidden",
-                        "-Command", ps_script,
-                    ],
-                    startupinfo=startupinfo,
-                    capture_output=True,
-                    text=True,
-                    timeout=12,
-                    creationflags=0x08000000,  # CREATE_NO_WINDOW
+                    ["powershell", "-NoLogo", "-NoProfile", "-NonInteractive",
+                     "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+                     "-Command", ps_script],
+                    startupinfo=startupinfo, capture_output=True, text=True,
+                    timeout=35, creationflags=0x08000000,
                 )
-
-                if "STARTED" in result.stdout:
-                    logging.info("Hotspot was OFF -> automatically STARTED.")
+                if "STARTED" in result.stdout or "ALREADY_ON" in result.stdout:
+                    logging.info("Mobile Hotspot was OFF -> successfully started.")
                     self._hotspot_failures = 0
-                elif "No_Internet_Profile" in result.stderr:
-                    logging.warning("Hotspot trigger skipped: Windows has not yet fully recognized the internet profile (NCSI pending).")
-                elif result.stderr.strip():
+                    self._hotspot_backoff_until = 0.0
+                elif "NO_PROFILE" in result.stdout:
+                    logging.warning("Hotspot start skipped: Windows has no internet connection profile.")
+                    self._hotspot_backoff_until = time.time() + self.HOTSPOT_RETRY_INTERVAL
+                else:
+                    detail = result.stderr.strip() or result.stdout.strip() or f"PowerShell exit {result.returncode}"
                     self._hotspot_failures += 1
-                    err_msg = result.stderr.strip().splitlines()[0] if result.stderr.strip() else ""
-                    if self._hotspot_failures >= 3:
-                        logging.error(f"Hotspot repeatedly failed ({err_msg}). Pausing attempts for 5 minutes.")
-                        self._hotspot_backoff_until = time.time() + 300.0
-                    else:
-                        logging.warning(f"Hotspot trigger warning: {err_msg}")
-
-            except (subprocess.TimeoutExpired, OSError) as e:
+                    logging.error(f"Mobile Hotspot start failed: {detail}")
+                    self._hotspot_backoff_until = time.time() + self.HOTSPOT_RETRY_INTERVAL
+            except Exception as e:
                 self._hotspot_failures += 1
-                logging.warning(f"Hotspot management failed: {e}")
+                logging.exception(f"Mobile Hotspot recovery failed: {e}")
+                self._hotspot_backoff_until = time.time() + self.HOTSPOT_RETRY_INTERVAL
             finally:
                 self._hotspot_lock.release()
 
-        # Izleme dongusunu bekletmemek icin PowerShell'i ayri arka plan thread'inde calistir
         threading.Thread(target=_worker, daemon=True).start()
 
     # --- Adaptor Reset ---
@@ -575,15 +638,38 @@ class NetworkWorker:
             logging.warning(f"Connection lost on '{adapter}'. Resetting adapter...")
 
             # shell=False + liste argumanlari: injection riski yok, path guvenligi var
-            subprocess.run(
-                ["netsh", "interface", "set", "interface", adapter, "disable"],
-                capture_output=True, creationflags=0x08000000
-            )
-            time.sleep(2)
-            subprocess.run(
-                ["netsh", "interface", "set", "interface", adapter, "enable"],
-                capture_output=True, creationflags=0x08000000
-            )
+            disabled = None
+            try:
+                disabled = subprocess.run(
+                    ["netsh", "interface", "set", "interface", adapter, "disable"],
+                    capture_output=True, text=True, timeout=10,
+                    creationflags=0x08000000
+                )
+                if disabled.returncode != 0:
+                    raise RuntimeError(disabled.stderr.strip() or disabled.stdout.strip() or "netsh disable failed")
+                time.sleep(2)
+                enabled = subprocess.run(
+                    ["netsh", "interface", "set", "interface", adapter, "enable"],
+                    capture_output=True, text=True, timeout=10,
+                    creationflags=0x08000000
+                )
+                if enabled.returncode != 0:
+                    raise RuntimeError(enabled.stderr.strip() or enabled.stdout.strip() or "netsh enable failed")
+            except (OSError, subprocess.TimeoutExpired, RuntimeError) as e:
+                logging.error(f"Adapter reset command failed for '{adapter}': {e}")
+                # If disable succeeded but enable failed, make one recovery
+                # attempt so a transient netsh error does not strand the NIC.
+                if disabled is not None and disabled.returncode == 0:
+                    try:
+                        subprocess.run(
+                            ["netsh", "interface", "set", "interface", adapter, "enable"],
+                            capture_output=True, text=True, timeout=10,
+                            creationflags=0x08000000
+                        )
+                    except (OSError, subprocess.TimeoutExpired) as recovery_error:
+                        logging.error(f"Adapter re-enable recovery failed: {recovery_error}")
+                self.status = Status.PASSIVE
+                return
 
             # --- Dinamik DHCP Polling ---
             # Golet senaryosu: ITU router oturumu sifirladiktan sonra
@@ -601,6 +687,7 @@ class NetworkWorker:
             else:
                 # while dongusu break olmadan bittiyse: timeout
                 logging.warning("DHCP timeout (25s). Main loop will retry.")
+                self.status = Status.PASSIVE
 
             self._hotspot_last_check = 0.0  # Reset sonrasi hotspot hemen kontrol edilsin
             self.manage_hotspot(force=True)
@@ -627,7 +714,7 @@ class NetworkWorker:
             if is_up and eth_ip and self._raw_check(bind_ip=eth_ip):
                 logging.info("Ethernet is ready and connected to internet.")
                 break
-            self._running.wait(1.0)
+            self._stop_event.wait(1.0)
 
         cable_unplugged_logged = False
 
@@ -663,7 +750,7 @@ class NetworkWorker:
             # time.sleep() yerine Event.wait():
             # exit_app() _running'i clear edince sleep bitmesini beklemez,
             # program aninda kapanir.
-            self._running.wait(timeout=self.config.data["check_interval"])
+            self._stop_event.wait(timeout=self.config.data["check_interval"])
 
 # ==============================================================================
 # 7. UI APP
@@ -727,30 +814,40 @@ class ITUApp:
 
     def manage_task_scheduler(self, enabled):
         task_name = "ITUNetAssistant"
-        exe_p     = sys.executable if sys.executable.lower().endswith(".exe") else sys.argv[0]
-        full_path = os.path.abspath(exe_p)
         try:
             if enabled:
+                if getattr(sys, "frozen", False):
+                    action = f'"{os.path.abspath(sys.executable)}" --background'
+                else:
+                    action = f'"{os.path.abspath(sys.executable)}" "{os.path.abspath(sys.argv[0])}" --background'
                 # shell=False + liste: path'de bosluk olsa bile guvenli
-                subprocess.run(
+                result = subprocess.run(
                     [
                         "schtasks", "/create",
                         "/tn", task_name,
-                        "/tr", f'"{full_path}" --background',
+                        "/tr", action,
                         "/sc", "onlogon",
                         "/rl", "highest",
                         "/f",
                     ],
-                    capture_output=True, creationflags=0x08000000
+                    capture_output=True, text=True, timeout=20,
+                    creationflags=0x08000000
                 )
-                logging.info(f"Task Scheduler entry created: {full_path}")
+                if result.returncode == 0:
+                    logging.info(f"Task Scheduler entry created: {action}")
+                else:
+                    logging.error(f"Task Scheduler create failed: {result.stderr.strip() or result.stdout.strip()}")
             else:
-                subprocess.run(
+                result = subprocess.run(
                     ["schtasks", "/delete", "/tn", task_name, "/f"],
-                    capture_output=True, creationflags=0x08000000
+                    capture_output=True, text=True, timeout=20,
+                    creationflags=0x08000000
                 )
-                logging.info("Task Scheduler entry removed.")
-        except OSError as e:
+                if result.returncode == 0:
+                    logging.info("Task Scheduler entry removed.")
+                else:
+                    logging.warning(f"Task Scheduler delete failed: {result.stderr.strip() or result.stdout.strip()}")
+        except (OSError, subprocess.TimeoutExpired) as e:
             logging.error(f"Task Scheduler error: {e}")
 
     def set_icon_via_win32(self):
@@ -932,9 +1029,16 @@ class ITUApp:
         self.worker.running = False   # _running.clear() -> wait() aninda uyanir
         self.tray_icon.stop()
         if self.window:
+            if threading.current_thread() is threading.main_thread():
+                self._finish_exit()
+            else:
+                self.window.after(0, self._finish_exit)
+
+    def _finish_exit(self):
+        if self.window:
             self.window.quit()
             self.window.destroy()
-        sys.exit()
+            self.window = None
 
 # ==============================================================================
 # ENTRY POINT
