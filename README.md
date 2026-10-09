@@ -1,14 +1,14 @@
 # ITU Net Assistant
 
-İTÜ yurtları gibi ağın sık koptuğu ortamlarda Ethernet bağlantısını otomatik olarak izleyen, koptuğunda adaptörü resetleyerek bağlantıyı tazeleyen ve ardından Windows Mobil Etkin Noktayı (Hotspot) otomatik açan Windows masaüstü aracı.
+İTÜ Gölet Yurtlarında ethernete bağlıyken bile ağın sık koptuğu ve diğer cihazların bağlanabileceği bir Wi-Fi ağı olmadığı bir ortamda Ethernet bağlantısını otomatik olarak izleyen, koptuğunda adaptörü resetleyerek bağlantıyı tazeleyen ve ardından diğer cihazlarınızın bağlanabilmesi için Windows Mobil İnternet Paylaşımını (Hotspot) otomatik açan ve sürekli açık kalmasını sağlayan Windows masaüstü aracı.
 
 ## Nasıl Çalışır?
 
-1. **Kablo Kontrolü:** Ethernet kablosu takılı değilse gereksiz reset atmaz, kablo takılana kadar pasif modda bekler.
+1. **Kablo Kontrolü:** Ethernet kablosu takılı değilse gereksiz reset atmaz veya hotspot'la ilgilenmez, kablo takılana kadar pasif modda bekler.
 2. **Doğrudan Ethernet Testi:** İnternet kontrolünü doğrudan Ethernet kartının IP adresine soket bağlayarak yapar. Bilgisayarda başka bir ağ (Wi-Fi vb.) açık olsa bile Ethernet'in gerçek durumu izlenir.
-3. **Otomatik Adaptör Reset:** Bağlantı kesildiğinde Ethernet adaptörünü devre dışı bırakıp tekrar etkinleştirir ve DHCP'den yeni IP gelene kadar bekler.
-4. **Hotspot Otomasyonu:** İnternet bağlantısı geldikten sonra Windows Mobil Etkin Noktayı (Hotspot) arka planda otomatik olarak açar.
-5. **Sistem Tepsisi (Tray) & Sessiz Başlangıç:** Kapatıldığında sistem tepsisine (saatin yanına) küçülür. İstenirse Windows açılışında kullanıcıyı rahatsız etmeden arka planda başlayacak şekilde ayarlanabilir.
+3. **Otomatik Adaptör Reset:** Bağlantı kesildiğinde Ethernet adaptörünü devre dışı bırakıp tekrar etkinleştirir ve DHCP'den yeni IP gelene kadar bekler. Bunun sonucunda genelde internet bağlantısı tekrar sağlanmış olur.
+4. **Hotspot Otomasyonu:** İnternet bağlantısı geldikten sonra Windows Mobil İnternet Paylaşımını (Hotspot) arka planda otomatik olarak açar ve belli aralıklarla açık kalmaya devam edip etmediğini kontrol eder, bir şekilde kapanırsa tekrar açar.
+5. **Sistem Tepsisi (Tray) & Sessiz Başlangıç:** Kapatıldığında sistem tepsisine küçülür. İstenirse Windows açılışında kullanıcıyı rahatsız etmeden arka planda başlayacak şekilde ayarlanabilir.
 
 ## Kullanım
 
