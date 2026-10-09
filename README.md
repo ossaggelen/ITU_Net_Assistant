@@ -1,43 +1,38 @@
-# 🚀 ITU Net Assistant - Ultimate Dashboard
+# ITU Net Assistant
 
-İTÜ Gölet Yurtları (ITU Pond Dormitories) gibi ağ bağlantısının sık koptuğu ortamlarda, internet bağlantısını otomatik olarak onaran ve Windows Hotspot'u sürekli aktif tutabilen gelişmiş bir masaüstü aracıdır. 
+İTÜ yurtları gibi ağın sık koptuğu ortamlarda Ethernet bağlantısını otomatik olarak izleyen, koptuğunda adaptörü resetleyerek bağlantıyı tazeleyen ve ardından Windows Mobil Etkin Noktayı (Hotspot) otomatik açan Windows masaüstü aracı.
 
-## ✨ Öne Çıkan Özellikler (Features)
+## Nasıl Çalışır?
 
-* **Akıllı İzleme (Smart Monitoring):** İnternet bağlantısını Port 80 üzerinden kontrol ederek firewall engellerini aşar (Port 80 Bypass). 
-* **Otomatik Onarım (Auto-Repair):** Bağlantı koptuğunda Ethernet adaptörünü otomatik olarak resetler (Adapter Reset). 
-* **Hotspot Otomasyonu:** İnternet geldikten sonra Windows Hotspot'u PowerShell/Windows Runtime API üzerinden otomatik olarak açar. 
-* **Sessiz Başlangıç (Silent Startup):** Windows Görev Zamanlayıcı (Task Scheduler) entegrasyonu ile bilgisayar açıldığında kullanıcıya sormadan arka planda başlar. 
-* **Tekil Örnek Koruması (Single Instance Protection):** Windows Mutex kullanarak uygulamanın aynı anda birden fazla kopyasının çalışmasını engeller.
-* **Modern Arayüz:** CustomTkinter ile oluşturulmuş, karanlık mod (Dark Mode) destekli dashboard.
+1. **Kablo Kontrolü:** Ethernet kablosu takılı değilse gereksiz reset atmaz, kablo takılana kadar pasif modda bekler.
+2. **Doğrudan Ethernet Testi:** İnternet kontrolünü doğrudan Ethernet kartının IP adresine soket bağlayarak yapar. Bilgisayarda başka bir ağ (Wi-Fi vb.) açık olsa bile Ethernet'in gerçek durumu izlenir.
+3. **Otomatik Adaptör Reset:** Bağlantı kesildiğinde Ethernet adaptörünü devre dışı bırakıp tekrar etkinleştirir ve DHCP'den yeni IP gelene kadar bekler.
+4. **Hotspot Otomasyonu:** İnternet bağlantısı geldikten sonra Windows Mobil Etkin Noktayı (Hotspot) arka planda otomatik olarak açar.
+5. **Sistem Tepsisi (Tray) & Sessiz Başlangıç:** Kapatıldığında sistem tepsisine (saatin yanına) küçülür. İstenirse Windows açılışında kullanıcıyı rahatsız etmeden arka planda başlayacak şekilde ayarlanabilir.
 
-## 🛠️ Teknik Detaylar (Technical Details)
+## Kullanım
 
-Bir bilgisayar mühendisi olarak bu projede aşağıdaki teknolojiler ve yöntemler kullanılmıştır: 
+Ağ kartını resetleyebilmek için uygulamanın yönetici yetkisiyle çalışması gerekir.
+`dist/ITUNetAssistant.exe` (veya derlenen tek dosya exe) doğrudan çalıştırılabilir.
 
-1. **Threading:** Ağ kontrolleri ve arayüz güncellemeleri, programın donmaması için ayrı iş parçacıklarında (Worker Threads) yürütülür.
-2. **Win32 API:** Pencere ikonlarını ve süreçleri (Process) yönetmek için doğrudan Windows çekirdek kütüphaneleriyle iletişim kurulur.
-3. **Persistence:** Uygulama ayarları `json` formatında saklanır ve `RotatingFileHandler` ile hata kayıtları (Logging) tutulur. 
-4. **IPC (Inter-Process Communication):** Uygulama kopyaları arasındaki çakışmayı önlemek için Mutex mekanizması uygulanmıştır. 
+* **Dashboard:** Bağlantı durumunu (Active, Passive, Resetting vb.) canlı gösterir; manuel reset atma, logları açma ve ayarları düzenleme seçenekleri sunar.
+* **Ayarlar:** Adaptör adı (varsayılan: `Ethernet`), kontrol aralığı ve başlangıçta otomatik çalışma tercihi `settings.json` dosyasında saklanır, arayüzden değiştirilebilir.
 
-## 📦 Kurulum ve Derleme (Installation & Build)
+## Kaynak Koddan Çalıştırma ve Derleme
 
-Projeyi yerel makinenizde çalıştırmak için: 
+### Geliştirme Ortamı
+```bash
+git clone https://github.com/ossaggelen/ITU_Net_Assistant.git
+cd ITU_Net_Assistant
+pip install -r requirements.txt
+python ITU_Net_Assistant.pyw
+```
 
-1. Depoyu Klonlayın (Clone the Repository):
-   ```bash
-   git clone https://github.com/ossaggelen/ITU-Net-Assistant.git
-   cd ITU-Net-Assistant
-   ```
+### .exe Derleme (Build)
+Uygulamayı bağımsız tek bir `.exe` haline getirmek için:
 
-2. Gereksinimleri Yükleyin (Install Dependencies):
-   ```bash
-   pip install -r requirements.txt
-   ```
+```bash
+pyinstaller ITUNetAssistant.spec
+```
 
-3. Uygulamayı Paketleyin (Build Executable):
-   Projeyi tek ve bağımsız bir `.exe` haline getirmek için PyInstaller ile `.spec` dosyasını derleyin:
-
-   ```bash
-   pyinstaller ITUNetAssistant.spec
-   ```
+Çıktı `dist/ITUNetAssistant.exe` konumunda oluşturulur.
