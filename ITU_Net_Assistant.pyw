@@ -7,6 +7,10 @@ import threading
 import logging
 import sys
 import ctypes
+import platform
+import atexit
+from ctypes import wintypes
+from datetime import datetime
 from enum import Enum
 from logging.handlers import RotatingFileHandler
 import customtkinter as ctk
@@ -14,12 +18,15 @@ from PIL import Image, ImageDraw, ImageTk
 import pystray
 from pystray import MenuItem as item
 
+APP_VERSION = "2026.10.22"
+
 # ==============================================================================
 # 1. WINDOWS IDENTITY
 # ==============================================================================
 WM_SETICON = 0x80
 ICON_SMALL  = 0
 ICON_BIG    = 1
+CREATE_NO_WINDOW = 0x08000000
 
 try:
     myappid = 'itu.ossaggelen.netassistant.final'
@@ -59,8 +66,94 @@ SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 LOG_PATH      = os.path.join(BASE_DIR, "ITU_Net_Assistant.log")
 
 # ==============================================================================
+# 1.1 LOGGING
+# Temiz, insan tarafindan okunabilir, sadece gercek olaylarda yazan logger.
+# ==============================================================================
+LOG_FORMAT         = "[%(asctime)s] %(levelname)s: %(message)s"
+LOG_DATE_FORMAT    = "%Y-%m-%d %H:%M:%S"
+LOG_BACKUP_COUNT   = 3
+DEFAULT_LOG_MAX_MB = 10
+
+def setup_logging(max_mb=DEFAULT_LOG_MAX_MB):
+    try:
+        max_bytes = int(max_mb) * 1024 * 1024
+    except (TypeError, ValueError):
+        max_bytes = DEFAULT_LOG_MAX_MB * 1024 * 1024
+
+    root = logging.getLogger()
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+        try:
+            h.close()
+        except Exception:
+            pass
+    try:
+        handler = RotatingFileHandler(
+            LOG_PATH, maxBytes=max_bytes, backupCount=LOG_BACKUP_COUNT, encoding="utf-8"
+        )
+    except OSError:
+        handler = logging.NullHandler()
+    handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT))
+    root.addHandler(handler)
+    # Varsayilan log seviyesi INFO: stabil durumda gereksiz ping/hotspot spam'i yapmaz
+    root.setLevel(logging.INFO)
+    for noisy in ("PIL", "pystray", "asyncio"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+def _log_unhandled(exc_type, exc_value, exc_tb):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    logging.critical("Beklenmeyen ana iş parçacığı hatası:", exc_info=(exc_type, exc_value, exc_tb))
+
+def _log_thread_exception(args):
+    if args.exc_type is SystemExit:
+        return
+    name = args.thread.name if args.thread else "?"
+    logging.critical(
+        f"İş parçacığında beklenmeyen hata ('{name}'):",
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
+
+sys.excepthook       = _log_unhandled
+threading.excepthook = _log_thread_exception
+setup_logging()
+
+def _one_line(text, limit=1000):
+    """Cok satirli komut ciktilarini tek log satirina indirger."""
+    if text is None:
+        return ""
+    if isinstance(text, bytes):
+        text = text.decode("oem", errors="replace")
+    s = " | ".join(line.strip() for line in str(text).splitlines() if line.strip())
+    if len(s) > limit:
+        s = s[:limit] + "..."
+    return s
+
+def run_cmd(args, timeout, label=None):
+    """Gizli pencereyle komut calistirir; yalnizca hata durumunda log yazar."""
+    label = label or args[0]
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 0
+    try:
+        result = subprocess.run(
+            args, capture_output=True, text=True, encoding="oem", errors="replace",
+            timeout=timeout, startupinfo=startupinfo, creationflags=CREATE_NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired:
+        logging.error(f"Komut zaman aşımına uğradı ({timeout}s): {label}")
+        raise
+    except OSError as e:
+        logging.error(f"Komut başlatılamadı ({label}): {e}")
+        raise
+    if result.returncode != 0:
+        err = _one_line(result.stderr or result.stdout)
+        logging.warning(f"Komut hata döndürdü ({label}, kod={result.returncode}): {err}")
+    return result
+
+# ==============================================================================
 # 2. STATUS ENUM
-# String karşılaştırması yerine Enum: typo hatası yok, IDE desteği var
 # ==============================================================================
 class Status(Enum):
     INITIALIZING = "Initializing..."
@@ -83,7 +176,7 @@ def check_single_instance():
     )
     if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
         ctypes.windll.user32.MessageBoxW(
-            0, "ITU Net Assistant zaten arka planda calisiyor!", "Bilgi", 0x40
+            0, "ITU Net Assistant zaten arka planda çalışıyor!", "Bilgi", 0x40
         )
         return False
     return True
@@ -98,10 +191,11 @@ def is_admin():
         return False
 
 if not is_admin():
-    # sys.executable'i dogrudan kullan; replace() ile .pythonw donusumu kirilgan
-    ctypes.windll.shell32.ShellExecuteW(
-        None, "runas", sys.executable, " ".join(sys.argv), None, 0
-    )
+    if getattr(sys, "frozen", False):
+        _params = subprocess.list2cmdline(sys.argv[1:])
+    else:
+        _params = subprocess.list2cmdline(sys.argv)
+    _rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, _params, None, 0)
     sys.exit()
 
 # ==============================================================================
@@ -120,7 +214,6 @@ def configure_hotspot_registry():
 configure_hotspot_registry()
 
 try:
-    from ctypes import wintypes
     _advapi32 = ctypes.windll.advapi32
     _advapi32.OpenSCManagerW.restype = wintypes.HANDLE
     _advapi32.OpenSCManagerW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
@@ -146,8 +239,17 @@ except Exception:
     _advapi32 = None
 
 # ==============================================================================
-# 4.2 WINDOWS NETWORK IPHLPAPI DEFINITIONS (ETHERNET LINK & IP STATUS)
+# 4.2 WINDOWS NETWORK IPHLPAPI DEFINITIONS
 # ==============================================================================
+AF_UNSPEC                 = 0
+AF_INET                   = 2
+GAA_FLAG_SKIP_ANYCAST     = 0x0002
+GAA_FLAG_SKIP_MULTICAST   = 0x0004
+GAA_FLAG_INCLUDE_GATEWAYS = 0x0080
+ERROR_BUFFER_OVERFLOW     = 111
+ERROR_NO_DATA             = 232
+IF_TYPE_IEEE80211         = 71
+
 try:
     _iphlpapi = ctypes.windll.iphlpapi
 
@@ -178,7 +280,7 @@ try:
         ("FirstUnicastAddress", ctypes.POINTER(_IP_ADAPTER_UNICAST_ADDRESS)),
         ("FirstAnycastAddress", ctypes.c_void_p),
         ("FirstMulticastAddress", ctypes.c_void_p),
-        ("FirstDnsServerAddress", ctypes.c_void_p),
+        ("FirstDnsServerAddress", ctypes.POINTER(_IP_ADAPTER_UNICAST_ADDRESS)),
         ("DnsSuffix", wintypes.LPWSTR),
         ("Description", wintypes.LPWSTR),
         ("FriendlyName", wintypes.LPWSTR),
@@ -188,6 +290,17 @@ try:
         ("Mtu", wintypes.DWORD),
         ("IfType", wintypes.DWORD),
         ("OperStatus", wintypes.DWORD),
+        ("Ipv6IfIndex", wintypes.DWORD),
+        ("ZoneIndices", wintypes.DWORD * 16),
+        ("FirstPrefix", ctypes.c_void_p),
+        ("TransmitLinkSpeed", ctypes.c_uint64),
+        ("ReceiveLinkSpeed", ctypes.c_uint64),
+        ("FirstWinsServerAddress", ctypes.c_void_p),
+        ("FirstGatewayAddress", ctypes.POINTER(_IP_ADAPTER_UNICAST_ADDRESS)),
+        ("Ipv4Metric", wintypes.ULONG),
+        ("Ipv6Metric", wintypes.ULONG),
+        ("Luid", ctypes.c_uint64),
+        ("Dhcpv4Server", _SOCKET_ADDRESS),
     ]
 
     class _SOCKADDR_IN(ctypes.Structure):
@@ -200,6 +313,64 @@ try:
 except Exception:
     _iphlpapi = None
 
+def _sockaddr_to_ipv4(sock_address):
+    ptr = sock_address.lpSockaddr
+    if not ptr:
+        return None
+    sa = _SOCKADDR_IN.from_address(ptr)
+    if sa.sin_family != AF_INET:
+        return None
+    return socket.inet_ntoa(bytes(sa.sin_addr))
+
+def _walk_ipv4_list(first):
+    out, node, guard = [], first, 0
+    while node and guard < 64:
+        ip = _sockaddr_to_ipv4(node.contents.Address)
+        if ip:
+            out.append(ip)
+        node = node.contents.Next
+        guard += 1
+    return out
+
+def enumerate_adapters():
+    if not _iphlpapi:
+        return None
+    flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_INCLUDE_GATEWAYS
+    size  = 32768
+    buf   = None
+    for _ in range(4):
+        buflen = wintypes.ULONG(size)
+        buf    = ctypes.create_string_buffer(size)
+        ret    = _iphlpapi.GetAdaptersAddresses(AF_UNSPEC, flags, None, ctypes.byref(buf), ctypes.byref(buflen))
+        if ret == ERROR_BUFFER_OVERFLOW:
+            size = buflen.value + 4096
+            continue
+        if ret == ERROR_NO_DATA:
+            return []
+        if ret != 0:
+            return None
+        break
+    else:
+        return None
+
+    adapters  = []
+    full_size = ctypes.sizeof(_IP_ADAPTER_ADDRESSES)
+    curr = ctypes.cast(buf, ctypes.POINTER(_IP_ADAPTER_ADDRESSES))
+    while curr:
+        a        = curr.contents
+        extended = a.Length >= full_size
+        ipv4_all = _walk_ipv4_list(a.FirstUnicastAddress)
+        adapters.append({
+            "name"       : a.FriendlyName or "",
+            "description": a.Description or "",
+            "if_type"    : a.IfType,
+            "oper_status": a.OperStatus,
+            "ipv4"       : [ip for ip in ipv4_all if not ip.startswith("169.254.")],
+            "gateways"   : _walk_ipv4_list(a.FirstGatewayAddress) if extended else [],
+        })
+        curr = a.Next
+    return adapters
+
 # ==============================================================================
 # 5. CONFIG
 # ==============================================================================
@@ -209,7 +380,7 @@ class Config:
             "adapter_name"  : "Ethernet",
             "check_interval": 5,
             "startup_delay" : 15,
-            "log_max_mb"    : 5,
+            "log_max_mb"    : DEFAULT_LOG_MAX_MB,
             "auto_start"    : True,
         }
         self.data = self.load()
@@ -231,8 +402,7 @@ class Config:
                 if not isinstance(merged.get("auto_start"), bool):
                     merged["auto_start"] = self.defaults["auto_start"]
                 return merged
-            except (json.JSONDecodeError, OSError, ValueError, TypeError) as e:
-                logging.warning(f"Settings load failed, using defaults: {e}")
+            except Exception:
                 return dict(self.defaults)
         return dict(self.defaults)
 
@@ -241,41 +411,65 @@ class Config:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, indent=4)
         except OSError as e:
-            logging.error(f"Settings save failed: {e}")
-            raise  # UI katmanina ilet; sessizce yutma
+            logging.error(f"Ayarlar kaydedilemedi: {e}")
+            raise
 
 # ==============================================================================
 # 6. NETWORK WORKER
 # ==============================================================================
 class NetworkWorker:
-    # Hotspot kapatildiginda en gec bir monitor turunda yeniden acmayi dene.
-    HOTSPOT_CHECK_INTERVAL = 5
-    HOTSPOT_RETRY_INTERVAL = 5
+    HOTSPOT_ON_INTERVAL    = 60  # Hotspot 'On' iken kontrol periyodu (CPU/işlem tasarrufu)
+    HOTSPOT_OFF_INTERVAL   = 10  # Hotspot kapalıyken veya bilinmiyorken kontrol periyodu
+    HOTSPOT_RETRY_INTERVAL = 10
+    HOTSPOT_MAX_BACKOFF    = 120
+
+    FAILS_BEFORE_RESET = 3
+    POST_ACTION_GRACE  = 30
+    RESET_BACKOFF      = [0, 30, 60, 120, 300, 600]
+    STABLE_RESET_CLEAR = 180
+    NETSH_TIMEOUT      = 30
+    DHCP_WAIT          = 25
+
+    CHECK_TARGETS = [
+        ("1.1.1.1", 80),
+        ("1.0.0.1", 80),
+        ("8.8.8.8", 53),
+    ]
 
     def __init__(self, config):
         self.config = config
 
-        # threading.Event: bool'dan farkli olarak gercek anlamda thread-safe
-        self._running = threading.Event()
+        self._running    = threading.Event()
         self._running.set()
-        # _running is set during normal work, so waits use a separate stop event.
         self._stop_event = threading.Event()
-        self._active  = threading.Event()
+        self._active     = threading.Event()
         self._active.set()
 
-        # Non-blocking acquire ile TOCTOU race condition'i onluyoruz
         self._reset_lock   = threading.Lock()
         self._hotspot_lock = threading.Lock()
 
         self._status      = Status.INITIALIZING
         self._status_lock = threading.Lock()
 
+        # Hotspot
         self._hotspot_last_check    = 0.0
         self._hotspot_failures      = 0
         self._hotspot_backoff_until = 0.0
-        self.setup_logging()
+        self._hotspot_last_state    = None
+        self._wifi_hw_present       = None
 
-    # --- Thread-safe property'ler ---
+        # Reset & Baglanti
+        self._consecutive_failures = 0
+        self._first_failure_at     = None
+        self._grace_until          = 0.0
+        self._grace_reason         = ""
+        self._reset_streak         = 0
+        self._next_reset_allowed   = 0.0
+        self._backoff_logged       = False
+        self._healthy_since        = None
+        self._cable_unplugged_logged = False
+        self._last_adapter_ip      = None
+
     @property
     def status(self):
         with self._status_lock:
@@ -292,6 +486,7 @@ class NetworkWorker:
 
     @is_active.setter
     def is_active(self, value: bool):
+        logging.info(f"İzleme kullanıcı tarafından {'AKTİF EDİLDİ' if value else 'DURDURULDU'}.")
         self._active.set() if value else self._active.clear()
 
     @property
@@ -307,189 +502,101 @@ class NetworkWorker:
             self._running.clear()
             self._stop_event.set()
 
-    # --- Logging ---
     def setup_logging(self):
-        max_bytes = self.config.data["log_max_mb"] * 1024 * 1024
-        handler   = RotatingFileHandler(
-            LOG_PATH, maxBytes=max_bytes, backupCount=1, encoding="utf-8"
-        )
-        handler.setFormatter(
-            logging.Formatter(
-                "[%(asctime)s] %(levelname)s: %(message)s", datefmt="%H:%M:%S"
-            )
-        )
-        root = logging.getLogger()
-        # Eski handler'lari kapat: settings degisince birikmeyi onler
-        for h in root.handlers[:]:
-            root.removeHandler(h)
-            h.close()
-        root.addHandler(handler)
-        root.setLevel(logging.INFO)
+        setup_logging(self.config.data["log_max_mb"])
 
-    # --- Adaptor Durum ve Baglanti Kontrolu ---
+    def _set_grace(self, reason):
+        self._grace_until  = time.time() + self.POST_ACTION_GRACE
+        self._grace_reason = reason
+
     def get_adapter_info(self, adapter_name=None):
-        """
-        Istenen adaptorun durumunu (OperStatus: 1=Up, digerleri=Down) ve
-        IPv4 adresini Win32 GetAdaptersAddresses ile 0.1 ms'de dondurur.
-        Donus: (is_up: bool, ip_address: str | None)
-        """
+        """Donus: (is_up: bool, ip_address: str | None)"""
         if not adapter_name:
             adapter_name = self.config.data["adapter_name"]
 
         if not _iphlpapi:
             return True, None
 
-        try:
-            buflen = wintypes.ULONG(16384)
-            buf    = ctypes.create_string_buffer(16384)
-            # AF_INET = 2, Flags = 14 (SKIP_ANYCAST | SKIP_MULTICAST | SKIP_DNS_SERVER)
-            ret = _iphlpapi.GetAdaptersAddresses(2, 14, None, ctypes.byref(buf), ctypes.byref(buflen))
-            if ret != 0:
-                return False, None
+        adapters = enumerate_adapters()
+        if adapters is None:
+            return False, None
 
-            curr = ctypes.cast(buf, ctypes.POINTER(_IP_ADAPTER_ADDRESSES))
-            while curr:
-                a = curr.contents
-                if a.FriendlyName and a.FriendlyName.lower() == adapter_name.lower():
-                    is_up  = (a.OperStatus == 1)
-                    ip_str = None
-                    u = a.FirstUnicastAddress
-                    while u:
-                        sa_ptr = u.contents.Address.lpSockaddr
-                        if sa_ptr:
-                            sa = _SOCKADDR_IN.from_address(sa_ptr)
-                            if sa.sin_family == 2:  # AF_INET
-                                parsed_ip = socket.inet_ntoa(bytes(sa.sin_addr))
-                                if not parsed_ip.startswith("169.254."):
-                                    ip_str = parsed_ip
-                                    break
-                        u = u.contents.Next
-                    return is_up, ip_str
-                curr = a.Next
-        except Exception as e:
-            logging.debug(f"Adapter info query error: {e}")
+        for d in adapters:
+            if d["name"].lower() == adapter_name.lower():
+                is_up = (d["oper_status"] == 1)
+                ip = d["ipv4"][0] if d["ipv4"] else None
+                if is_up and ip and ip != self._last_adapter_ip:
+                    if self._last_adapter_ip is not None:
+                        logging.info(f"Ethernet IP adresi değişti: {self._last_adapter_ip} -> {ip}")
+                    self._last_adapter_ip = ip
+                return is_up, ip
         return False, None
-
-    def _socket_check(self, ip, port, bind_ip, results, lock):
-        # Per-socket timeout: global setdefaulttimeout() tum thread'leri etkiler
-        s = None
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(2)
-            if bind_ip:
-                s.bind((bind_ip, 0))
-            s.connect((ip, port))
-            with lock:
-                results.append(True)
-        except OSError:
-            with lock:
-                results.append(False)
-        finally:
-            if s is not None:
-                try:
-                    s.close()
-                except OSError:
-                    pass
 
     def _run_checks(self, bind_ip=None):
         """
-        Guvenilir 3 hedefe (Cloudflare HTTP, Cloudflare Secondary, Google DNS TCP)
-        Ethernet IP'sine bagli socket ile paralel baglanti dener.
+        Ethernet IP'sine bağlı soket ile hedefleri sırayla dener (kısa devre / short-circuit).
+        İlk hedef başarılı olursa hemen döner (ortalama 2-15 ms, 0 thread oluşturma, minimum ağ yükü).
+        İlk hedef başarısız olursa diğer hedeflere sırayla geçilir.
         """
-        # A check without the selected Ethernet IPv4 would silently use another
-        # route (often Wi-Fi) and could conceal a broken Ethernet connection.
         if not bind_ip:
             return False
 
-        results = []
-        lock    = threading.Lock()
-        targets = [
-            ("1.1.1.1", 80),
-            ("1.0.0.1", 80),
-            ("8.8.8.8", 53),
-        ]
-        threads = [
-            threading.Thread(
-                target=self._socket_check, args=(ip, port, bind_ip, results, lock), daemon=True
-            )
-            for ip, port in targets
-        ]
-        for t in threads: t.start()
-        for t in threads: t.join(timeout=3)
-        return any(results)
+        for ip, port in self.CHECK_TARGETS:
+            s = None
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1.5)
+                s.bind((bind_ip, 0))
+                s.connect((ip, port))
+                return True
+            except OSError:
+                continue
+            finally:
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+        return False
 
     def is_connected(self, bind_ip=None):
-        """Baglantiyi kontrol eder ve status'u gunceller."""
         connected = self._run_checks(bind_ip=bind_ip)
         self.status = Status.ACTIVE if connected else Status.PASSIVE
         return connected
 
     def _raw_check(self, bind_ip=None):
-        """
-        Status'a DOKUNMADAN baglantiyi kontrol eder.
-        reset_adapter_logic icindeki DHCP polling'de kullanilir:
-        reset surecinde status "Resetting..." sabit kalmali;
-        is_connected() bunu "Passive"/"Active" yapip UI'da flicker'a yol acardi.
-        """
         return self._run_checks(bind_ip=bind_ip)
 
-    # --- Hotspot Yonetimi ---
+    def _diagnose_failure(self, adapter):
+        adapters = enumerate_adapters() or []
+        for d in adapters:
+            if d["name"].lower() == adapter.lower():
+                gws = d["gateways"]
+                if not gws:
+                    return "Varsayılan ağ geçidi (Gateway) yok"
+                gw = gws[0]
+                try:
+                    r = run_cmd(["ping", "-n", "1", "-w", "1000", gw], timeout=3, label="ping-gw")
+                    if r.returncode == 0 and "TTL=" in r.stdout.upper():
+                        return f"Gateway ({gw}) yanıt veriyor, dış internet erişimi yok"
+                    return f"Gateway ({gw}) yanıt vermiyor (yerel hat kopuk)"
+                except Exception:
+                    return f"Gateway ({gw}) pinglenemedi"
+        return "Adaptör bilgisi alınamadı"
+
     def has_wifi_hardware(self):
-        """
-        Sistemde calisir durumda (IfType == 71 / 802.11) bir Wi-Fi adaptoru var mi?
-        Wi-Fi karti Kod 10 (CM_PROB_FAILED_START) vermisse veya devre disiysa False doner.
-        """
         if not _iphlpapi:
             return True
-        try:
-            buflen = wintypes.ULONG(16384)
-            buf    = ctypes.create_string_buffer(16384)
-            ret    = _iphlpapi.GetAdaptersAddresses(2, 14, None, ctypes.byref(buf), ctypes.byref(buflen))
-            if ret != 0:
-                return False
-            curr = ctypes.cast(buf, ctypes.POINTER(_IP_ADAPTER_ADDRESSES))
-            while curr:
-                a = curr.contents
-                if a.IfType == 71:  # IF_TYPE_IEEE80211
-                    return True
-                curr = a.Next
-        except Exception:
-            pass
-        return False
+        adapters = enumerate_adapters()
+        if adapters is None:
+            return True
+        wifi = [
+            a for a in adapters
+            if a["if_type"] == IF_TYPE_IEEE80211 and "wi-fi direct" not in a["description"].lower()
+        ]
+        return bool(wifi)
 
-    def is_hotspot_active(self):
-        """
-        Hotspot'un aktif olup olmadigini Windows Mobile Hotspot Service (icssvc)
-        durumundan 0.05 ms'de, hicbir process spawn etmeden ve CPU harcamadan sorgular.
-        Wi-Fi donanimi yoksa veya Kod 10 ile cokmusse dogrudan False doner.
-        """
-        if not self.has_wifi_hardware():
-            return False
-        if not _advapi32:
-            return False
-        try:
-            scm = _advapi32.OpenSCManagerW(None, None, 0x0001)  # SC_MANAGER_CONNECT
-            if not scm:
-                return False
-            try:
-                svc = _advapi32.OpenServiceW(scm, "icssvc", 0x0004)  # SERVICE_QUERY_STATUS
-                if not svc:
-                    return False
-                try:
-                    status = _SERVICE_STATUS()
-                    if _advapi32.QueryServiceStatus(svc, ctypes.byref(status)):
-                        # 2: SERVICE_START_PENDING, 4: SERVICE_RUNNING
-                        return status.dwCurrentState in (2, 4)
-                finally:
-                    _advapi32.CloseServiceHandle(svc)
-            finally:
-                _advapi32.CloseServiceHandle(scm)
-        except Exception as e:
-            logging.debug(f"Hotspot status check error: {e}")
-        return False
-
-    def _hotspot_should_be_active(self):
-        """Check the actual tethering state, not just whether icssvc is running."""
+    def _query_hotspot_state(self):
         ps_script = (
             "$ErrorActionPreference = 'Stop'; "
             "$cp = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType = WindowsRuntime]::GetInternetConnectionProfile(); "
@@ -498,131 +605,126 @@ class NetworkWorker:
             "if (-not $tm) { Write-Output 'NO_MANAGER'; exit 0 }; "
             "Write-Output $tm.TetheringOperationalState.ToString()"
         )
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = 0
         try:
-            result = subprocess.run(
+            result = run_cmd(
                 ["powershell", "-NoLogo", "-NoProfile", "-NonInteractive",
                  "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
                  "-Command", ps_script],
-                startupinfo=startupinfo, capture_output=True, text=True,
-                timeout=8, creationflags=0x08000000,
+                timeout=8, label="ps-hotspot-state",
             )
-        except (OSError, subprocess.TimeoutExpired) as e:
-            logging.warning(f"Could not query Windows hotspot state: {e}")
+        except Exception:
             return None
         if result.returncode != 0:
-            logging.warning(f"Hotspot state query failed: {result.stderr.strip()}")
             return None
-        state = result.stdout.strip().splitlines()
-        if not state:
-            return None
-        if state[-1] == "On":
-            return True
-        if state[-1] == "Off":
-            return False
-        logging.info(f"Hotspot state unavailable ({state[-1]}).")
-        return None
+        lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+        return lines[-1] if lines else None
 
     def manage_hotspot(self, force=False):
         now = time.time()
-
-        # The active state is queried through the packaged tethering API. The
-        # icssvc service may remain running even when Mobile Hotspot is Off.
-        if not self.has_wifi_hardware():
-            if self._hotspot_failures == 0:
-                logging.warning("No operational Wi-Fi adapter detected (hardware may be in Code 10 error or disabled). Hotspot skipped.")
-            self._hotspot_failures += 1
-            self._hotspot_backoff_until = now + self.HOTSPOT_RETRY_INTERVAL
+        wifi = self.has_wifi_hardware()
+        if wifi != self._wifi_hw_present:
+            if wifi:
+                logging.info("Kullanılabilir Wi-Fi bağdaştırıcısı algılandı. Hotspot yönetimi devrede.")
+                self._hotspot_failures      = 0
+                self._hotspot_backoff_until = 0.0
+            else:
+                logging.warning("Kullanılabilir Wi-Fi bağdaştırıcısı bulunamadı (devre dışı veya Kod 10 hatası). Hotspot atlandı.")
+            self._wifi_hw_present = wifi
+        if not wifi:
             return
 
-        # Do not let a previous failure suppress recovery indefinitely: retry
-        # on each normal monitor interval, while still preventing overlap.
         if now < self._hotspot_backoff_until:
             return
-        if not force and (now - self._hotspot_last_check < self.HOTSPOT_CHECK_INTERVAL):
+
+        # Hotspot zaten On ise seyrek kontrol et (60s), kapaliysa hizla acabilmek icin sik kontrol et (10s)
+        interval = self.HOTSPOT_ON_INTERVAL if self._hotspot_last_state == "On" else self.HOTSPOT_OFF_INTERVAL
+        if not force and (now - self._hotspot_last_check < interval):
             return
         if not self._hotspot_lock.acquire(blocking=False):
             return
         self._hotspot_last_check = now
 
-        def _worker():
-            try:
-                state = self._hotspot_should_be_active()
-                if state is True:
-                    self._hotspot_failures = 0
-                    self._hotspot_backoff_until = 0.0
-                    return
-                if state is None:
-                    self._hotspot_failures += 1
-                    self._hotspot_backoff_until = time.time() + self.HOTSPOT_RETRY_INTERVAL
-                    return
+        threading.Thread(target=self._hotspot_worker, daemon=True).start()
 
-                # Off is confirmed by Windows; issue StartTetheringAsync and
-                # wait for its real operation result before declaring success.
-                ps_script = (
-                    "$ErrorActionPreference = 'Stop'; "
-                    "$cp = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType = WindowsRuntime]::GetInternetConnectionProfile(); "
-                    "if (-not $cp) { Write-Output 'NO_PROFILE'; exit 0 }; "
-                    "$tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType = WindowsRuntime]::CreateFromConnectionProfile($cp); "
-                    "if ($tm.TetheringOperationalState.ToString() -eq 'On') { Write-Output 'ALREADY_ON'; exit 0 }; "
-                    "Add-Type -AssemblyName System.Runtime.WindowsRuntime; "
-                    "$ext = [System.WindowsRuntimeSystemExtensions]; "
-                    "$asTaskMethod = ($ext.GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]; "
-                    "$op = $tm.StartTetheringAsync(); "
-                    "$asTask = $asTaskMethod.MakeGenericMethod([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult]); "
-                    "$task = $asTask.Invoke($null, @($op)); "
-                    "if (-not $task.Wait(30000)) { throw 'Start_timed_out' }; "
-                    "$result = $task.Result; "
-                    "if ($result.Status.ToString() -eq 'Success') { Write-Output 'STARTED' } "
-                    "else { throw ('Start_failed: ' + $result.Status.ToString() + ' ' + $result.AdditionalErrorMessage) }"
-                )
-
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                startupinfo.wShowWindow = 0
-                result = subprocess.run(
-                    ["powershell", "-NoLogo", "-NoProfile", "-NonInteractive",
-                     "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
-                     "-Command", ps_script],
-                    startupinfo=startupinfo, capture_output=True, text=True,
-                    timeout=35, creationflags=0x08000000,
-                )
-                if "STARTED" in result.stdout or "ALREADY_ON" in result.stdout:
-                    logging.info("Mobile Hotspot was OFF -> successfully started.")
-                    self._hotspot_failures = 0
-                    self._hotspot_backoff_until = 0.0
-                elif "NO_PROFILE" in result.stdout:
-                    logging.warning("Hotspot start skipped: Windows has no internet connection profile.")
-                    self._hotspot_backoff_until = time.time() + self.HOTSPOT_RETRY_INTERVAL
-                else:
-                    detail = result.stderr.strip() or result.stdout.strip() or f"PowerShell exit {result.returncode}"
-                    self._hotspot_failures += 1
-                    logging.error(f"Mobile Hotspot start failed: {detail}")
-                    self._hotspot_backoff_until = time.time() + self.HOTSPOT_RETRY_INTERVAL
-            except Exception as e:
-                self._hotspot_failures += 1
-                logging.exception(f"Mobile Hotspot recovery failed: {e}")
-                self._hotspot_backoff_until = time.time() + self.HOTSPOT_RETRY_INTERVAL
-            finally:
-                self._hotspot_lock.release()
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    # --- Adaptor Reset ---
-    def reset_adapter_logic(self, is_manual=False):
-        # Non-blocking acquire: zaten reset varsa ikinci bir reset baslatma
-        if not self._reset_lock.acquire(blocking=False):
-            return
+    def _hotspot_worker(self):
         try:
-            adapter = self.config.data["adapter_name"]
+            state = self._query_hotspot_state()
+            if state != self._hotspot_last_state:
+                if state in ("On", "Off"):
+                    # Sadece Off iken veya On'a dondugunde bilgi ver
+                    if state == "Off" and self._hotspot_last_state == "On":
+                        logging.warning("Mobil Etkin Nokta kapandı -> tekrar açılacak.")
+                self._hotspot_last_state = state
 
-            # Manuel degilse 1.5s bekle; kablo durumunu ve gecici kopuklugu teyit et
+            if state == "On":
+                self._hotspot_failures      = 0
+                self._hotspot_backoff_until = 0.0
+                return
+
+            if state != "Off":
+                # InTransition vb. durumlarda bekle
+                self._hotspot_failures += 1
+                delay = min(self.HOTSPOT_RETRY_INTERVAL * (2 ** (self._hotspot_failures - 1)), self.HOTSPOT_MAX_BACKOFF)
+                self._hotspot_backoff_until = time.time() + delay
+                return
+
+            # Off -> Başlat
+            self._set_grace("hotspot açılıyor")
+            ps_script = (
+                "$ErrorActionPreference = 'Stop'; "
+                "$cp = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType = WindowsRuntime]::GetInternetConnectionProfile(); "
+                "if (-not $cp) { Write-Output 'NO_PROFILE'; exit 0 }; "
+                "$tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType = WindowsRuntime]::CreateFromConnectionProfile($cp); "
+                "if ($tm.TetheringOperationalState.ToString() -eq 'On') { Write-Output 'ALREADY_ON'; exit 0 }; "
+                "Add-Type -AssemblyName System.Runtime.WindowsRuntime; "
+                "$ext = [System.WindowsRuntimeSystemExtensions]; "
+                "$asTaskMethod = ($ext.GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]; "
+                "$op = $tm.StartTetheringAsync(); "
+                "$asTask = $asTaskMethod.MakeGenericMethod([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult]); "
+                "$task = $asTask.Invoke($null, @($op)); "
+                "if (-not $task.Wait(30000)) { throw 'Start_timed_out' }; "
+                "$result = $task.Result; "
+                "if ($result.Status.ToString() -eq 'Success') { Write-Output 'STARTED' } "
+                "else { throw ('Start_failed: ' + $result.Status.ToString()) }"
+            )
+            result = run_cmd(
+                ["powershell", "-NoLogo", "-NoProfile", "-NonInteractive",
+                 "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+                 "-Command", ps_script],
+                timeout=35, label="ps-hotspot-start"
+            )
+            if "STARTED" in result.stdout or "ALREADY_ON" in result.stdout:
+                logging.info("Mobil Etkin Nokta (Hotspot) kapalıydı -> başarıyla başlatıldı.")
+                self._hotspot_failures      = 0
+                self._hotspot_backoff_until = 0.0
+                self._hotspot_last_state    = "On"
+                self._set_grace("hotspot başlatıldı")
+            else:
+                self._hotspot_failures += 1
+                delay = min(self.HOTSPOT_RETRY_INTERVAL * (2 ** (self._hotspot_failures - 1)), self.HOTSPOT_MAX_BACKOFF)
+                self._hotspot_backoff_until = time.time() + delay
+                logging.error(f"Mobil Etkin Nokta başlatılamadı ({_one_line(result.stderr or result.stdout)}). {delay}s sonra tekrar denenecek.")
+        except Exception as e:
+            self._hotspot_failures += 1
+            self._hotspot_backoff_until = time.time() + self.HOTSPOT_RETRY_INTERVAL
+            logging.error(f"Hotspot işlemi sırasında hata: {e}")
+        finally:
+            self._hotspot_lock.release()
+
+    def reset_adapter_logic(self, is_manual=False):
+        if not self._reset_lock.acquire(blocking=False):
+            logging.info("Reset isteği atlandı: zaten bir reset işlemi yürütülüyor.")
+            return
+
+        adapter = self.config.data["adapter_name"]
+        trigger = "Manuel" if is_manual else "Otomatik"
+        restored = False
+
+        try:
             if not is_manual:
                 is_up, bind_ip = self.get_adapter_info(adapter)
                 if not is_up:
-                    logging.info(f"Reset cancelled: '{adapter}' cable is unplugged.")
+                    logging.info(f"Reset iptal edildi: '{adapter}' kablosu takılı değil.")
                     self.status = Status.NO_CABLE
                     return
 
@@ -632,132 +734,172 @@ class NetworkWorker:
                     self.status = Status.NO_CABLE
                     return
                 if self._raw_check(bind_ip=bind_ip):
+                    logging.info("Reset iptal edildi: bağlantı yeniden kontrol sırasında kendiliğinden düzeldi.")
+                    self._consecutive_failures = 0
+                    self._first_failure_at     = None
                     return
 
             self.status = Status.RESETTING
-            logging.warning(f"Connection lost on '{adapter}'. Resetting adapter...")
+            logging.warning(f"Bağlantı kesildi. '{adapter}' adaptörü resetleniyor ({trigger})...")
 
-            # shell=False + liste argumanlari: injection riski yok, path guvenligi var
-            disabled = None
             try:
-                disabled = subprocess.run(
-                    ["netsh", "interface", "set", "interface", adapter, "disable"],
-                    capture_output=True, text=True, timeout=10,
-                    creationflags=0x08000000
-                )
-                if disabled.returncode != 0:
-                    raise RuntimeError(disabled.stderr.strip() or disabled.stdout.strip() or "netsh disable failed")
+                run_cmd(["netsh", "interface", "set", "interface", adapter, "disable"], timeout=self.NETSH_TIMEOUT, label="netsh-disable")
                 time.sleep(2)
-                enabled = subprocess.run(
-                    ["netsh", "interface", "set", "interface", adapter, "enable"],
-                    capture_output=True, text=True, timeout=10,
-                    creationflags=0x08000000
-                )
-                if enabled.returncode != 0:
-                    raise RuntimeError(enabled.stderr.strip() or enabled.stdout.strip() or "netsh enable failed")
-            except (OSError, subprocess.TimeoutExpired, RuntimeError) as e:
-                logging.error(f"Adapter reset command failed for '{adapter}': {e}")
-                # If disable succeeded but enable failed, make one recovery
-                # attempt so a transient netsh error does not strand the NIC.
-                if disabled is not None and disabled.returncode == 0:
-                    try:
-                        subprocess.run(
-                            ["netsh", "interface", "set", "interface", adapter, "enable"],
-                            capture_output=True, text=True, timeout=10,
-                            creationflags=0x08000000
-                        )
-                    except (OSError, subprocess.TimeoutExpired) as recovery_error:
-                        logging.error(f"Adapter re-enable recovery failed: {recovery_error}")
+                run_cmd(["netsh", "interface", "set", "interface", adapter, "enable"], timeout=self.NETSH_TIMEOUT, label="netsh-enable")
+            except Exception as e:
+                logging.error(f"Adaptör reset komutu başarısız oldu: {e}")
+                # Güvenlik: Kartın devre dışı kalmasını önlemek için kurtarma amaçlı tekrar enable dene
+                try:
+                    run_cmd(["netsh", "interface", "set", "interface", adapter, "enable"], timeout=self.NETSH_TIMEOUT, label="netsh-enable-recovery")
+                except Exception:
+                    pass
                 self.status = Status.PASSIVE
                 return
 
-            # --- Dinamik DHCP Polling ---
-            # Golet senaryosu: ITU router oturumu sifirladiktan sonra
-            # IP alma suresi degisken; sabit 8s yetersiz kaliyordu.
-            # _raw_check() kullaniyoruz: reset surecinde "Resetting..." sabit kalsin
-            logging.info("Reset complete. Waiting for DHCP (max 25s)...")
-            deadline = time.time() + 25
+            logging.info(f"Reset komutları tamamlandı. DHCP'den IP bekleniyor (en fazla {self.DHCP_WAIT}s)...")
+            deadline = time.time() + self.DHCP_WAIT
             while time.time() < deadline:
-                time.sleep(2)
-                is_up, bind_ip = self.get_adapter_info(adapter)
-                if is_up and self._raw_check(bind_ip=bind_ip):
-                    logging.info("DHCP acquired. Connection restored on Ethernet.")
-                    self.status = Status.ACTIVE
+                if self._stop_event.wait(2):
                     break
+                is_up, bind_ip = self.get_adapter_info(adapter)
+                if is_up and bind_ip and self._raw_check(bind_ip=bind_ip):
+                    restored = True
+                    break
+
+            if restored:
+                logging.info(f"DHCP alındı. Bağlantı tekrar kuruldu (IP: {bind_ip}).")
+                self.status = Status.ACTIVE
             else:
-                # while dongusu break olmadan bittiyse: timeout
-                logging.warning("DHCP timeout (25s). Main loop will retry.")
+                logging.warning(f"DHCP zaman aşımı ({self.DHCP_WAIT}s). IP alınamadı; ana döngü tekrar deneyecek.")
                 self.status = Status.PASSIVE
-
-            self._hotspot_last_check = 0.0  # Reset sonrasi hotspot hemen kontrol edilsin
-            self.manage_hotspot(force=True)
         finally:
-            self._reset_lock.release()
+            try:
+                if not is_manual:
+                    self._reset_streak += 1
+                    delay = self.RESET_BACKOFF[min(self._reset_streak, len(self.RESET_BACKOFF) - 1)]
+                    self._next_reset_allowed = time.time() + delay
+                    self._backoff_logged     = False
+                    if delay > 0:
+                        logging.warning(f"Arka arkaya otomatik reset önleme devrede: Sonraki reset en erken {delay}s sonra yapılabilecek.")
+                self._consecutive_failures = 0
+                self._first_failure_at     = None
+                self._set_grace("reset sonrası")
+            finally:
+                self._reset_lock.release()
 
-    # --- Ana Izleme Dongusu ---
+        if restored:
+            self._hotspot_last_check    = 0.0
+            self._hotspot_backoff_until = 0.0
+            self.manage_hotspot(force=True)
+
+    def _monitor_tick(self):
+        if not self._active.is_set():
+            self.status = Status.PAUSED
+            self._cable_unplugged_logged = False
+            self._consecutive_failures   = 0
+            self._first_failure_at       = None
+            return
+
+        if self._reset_lock.locked():
+            return
+
+        adapter = self.config.data["adapter_name"]
+        is_up, eth_ip = self.get_adapter_info(adapter)
+
+        if not is_up:
+            self.status = Status.NO_CABLE
+            if not self._cable_unplugged_logged:
+                logging.info(f"Ethernet kablosu takılı değil veya '{adapter}' devre dışı. Onarım ve hotspot duraklatıldı.")
+                self._cable_unplugged_logged = True
+            self._consecutive_failures = 0
+            self._first_failure_at     = None
+            self._healthy_since        = None
+            return
+
+        if self._cable_unplugged_logged:
+            logging.info(f"Ethernet kablosu takıldı ('{adapter}'). İzleme sürdürülüyor.")
+            self._cable_unplugged_logged = False
+
+        connected = self.is_connected(bind_ip=eth_ip)
+        now = time.time()
+
+        if connected:
+            if self._consecutive_failures or self._first_failure_at:
+                outage = int(now - self._first_failure_at) if self._first_failure_at else 0
+                logging.info(f"Bağlantı reset gerekmeden kendiliğinden düzeldi (~{outage}s kesinti sonrasında).")
+            self._consecutive_failures = 0
+            self._first_failure_at     = None
+            if self._healthy_since is None:
+                self._healthy_since = now
+            if self._reset_streak and now - self._healthy_since >= self.STABLE_RESET_CLEAR:
+                self._reset_streak       = 0
+                self._next_reset_allowed = 0.0
+            self.manage_hotspot()
+            return
+
+        # Baglanti yok
+        self._healthy_since = None
+        if self._first_failure_at is None:
+            self._first_failure_at = now
+
+        if now < self._grace_until:
+            # Koruma suresinde log basma
+            return
+
+        self._consecutive_failures += 1
+        n = self._consecutive_failures
+        diag = self._diagnose_failure(adapter)
+        logging.warning(f"İnternet bağlantısı kurulamadı ({n}/{self.FAILS_BEFORE_RESET}). Durum: {diag}")
+
+        if n < self.FAILS_BEFORE_RESET:
+            return
+
+        if now < self._next_reset_allowed:
+            remaining = int(self._next_reset_allowed - now)
+            if not self._backoff_logged:
+                logging.warning(f"Reset fırtınası koruması: {remaining}s bekleniyor. Süre bitince bağlantı hala yoksa reset atılacak.")
+                self._backoff_logged = True
+            return
+
+        threading.Thread(target=self.reset_adapter_logic, daemon=True).start()
+
     def run(self):
-        """
-        Sadece bilgisayar Ethernet ile internete bagliyken calisir.
-        Kablo takili degilse reset atmaz, beklemede kalir.
-        Golet'teki 'Silent Drop' sorununu periyodik Ethernet soket testiyle cozer.
-        """
-        logging.info("=== MONITORING STARTED ===")
+        logging.info("=== İZLEME BAŞLATILDI ===")
 
-        # Akilli baslangic beklemesi:
-        # PC acilisinda Windows'un Ethernet kartini ayaga kaldirip DHCP IP almasi 10s surebiliyor.
-        # Erken gelirse hemen baslar, gelmezse startup_delay suresince sabirla bekler.
         startup_delay = self.config.data.get("startup_delay", 15)
-        logging.info(f"Waiting for Ethernet initialization (up to {startup_delay}s)...")
-        deadline = time.time() + startup_delay
+        logging.info(f"Ethernet bağlantısının oturması bekleniyor (en fazla {startup_delay}s)...")
+        t0       = time.time()
+        deadline = t0 + startup_delay
+        ready    = False
+        is_up, eth_ip = False, None
+
         while self._running.is_set() and time.time() < deadline:
             is_up, eth_ip = self.get_adapter_info()
             if is_up and eth_ip and self._raw_check(bind_ip=eth_ip):
-                logging.info("Ethernet is ready and connected to internet.")
+                logging.info(f"Ethernet hazır ve internete bağlı (IP: {eth_ip}).")
+                ready = True
                 break
             self._stop_event.wait(1.0)
 
-        cable_unplugged_logged = False
+        if not ready:
+            logging.warning(f"Ethernet {startup_delay}s içinde hazır olamadı; izleme döngüsüne geçiliyor.")
 
         while self._running.is_set():
-            if self._active.is_set():
-                adapter = self.config.data["adapter_name"]
-                is_up, eth_ip = self.get_adapter_info(adapter)
+            try:
+                self._monitor_tick()
+            except Exception as e:
+                logging.exception(f"İzleme döngüsünde beklenmeyen hata: {e}")
 
-                if not is_up:
-                    # ETHERNET KABLOSU TAKILI DEGIL
-                    self.status = Status.NO_CABLE
-                    if not cable_unplugged_logged:
-                        logging.info(f"Ethernet cable unplugged or '{adapter}' is down. Suspending auto-repair and auto-hotspot.")
-                        cable_unplugged_logged = True
-                else:
-                    # ETHERNET KABLOSU TAKILI
-                    if cable_unplugged_logged:
-                        logging.info(f"Ethernet cable reconnected on '{adapter}'. Resuming monitoring.")
-                        cable_unplugged_logged = False
-
-                    if not self._reset_lock.locked():
-                        if not self.is_connected(bind_ip=eth_ip):
-                            logging.warning("No internet on Ethernet -> starting reset...")
-                            threading.Thread(
-                                target=self.reset_adapter_logic, daemon=True
-                            ).start()
-                        else:
-                            self.manage_hotspot()
-            else:
-                self.status = Status.PAUSED
-                cable_unplugged_logged = False
-
-            # time.sleep() yerine Event.wait():
-            # exit_app() _running'i clear edince sleep bitmesini beklemez,
-            # program aninda kapanir.
             self._stop_event.wait(timeout=self.config.data["check_interval"])
+
+        logging.info("=== İZLEME DURDURULDU ===")
 
 # ==============================================================================
 # 7. UI APP
 # ==============================================================================
 class ITUApp:
-    def __init__(self):
-        self.config     = Config()
+    def __init__(self, config=None):
+        self.config     = config or Config()
         self.worker     = NetworkWorker(self.config)
         self.window     = None
         self.icon_photo = None
@@ -776,20 +918,24 @@ class ITUApp:
             "ITU_Net", self.tray_img, "ITU Net Assistant",
             menu=pystray.Menu(
                 item("Open Dashboard", self._tray_open, default=True),
-                item("Force Reset", lambda *_: threading.Thread(
-                    target=self.worker.reset_adapter_logic, args=(True,), daemon=True
-                ).start()),
+                item("Force Reset", self._tray_force_reset),
                 pystray.Menu.SEPARATOR,
-                item("Exit Program", self.exit_app),
+                item("Exit Program", self._tray_exit),
             )
         )
         threading.Thread(target=self.tray_icon.run, daemon=True).start()
 
-    # pystray callback'leri kendi thread'inden cagirilir; tkinter sadece main
-    # thread'de calisabilir. window.after(0,...) ile main thread'e yonlendiriyoruz.
     def _tray_open(self, *_):
         if self.window:
             self.window.after(0, self._bring_to_front)
+
+    def _tray_force_reset(self, *_):
+        threading.Thread(
+            target=self.worker.reset_adapter_logic, args=(True,), daemon=True
+        ).start()
+
+    def _tray_exit(self, *_):
+        self.exit_app()
 
     def _bring_to_front(self):
         self.window.deiconify()
@@ -803,7 +949,7 @@ class ITUApp:
                     with Image.open(path) as pil_img:
                         self.tray_img = pil_img.resize((64, 64), Image.Resampling.LANCZOS)
                     return
-                except (OSError, Exception):
+                except Exception:
                     pass
         self._fallback_tray_img()
 
@@ -820,8 +966,7 @@ class ITUApp:
                     action = f'"{os.path.abspath(sys.executable)}" --background'
                 else:
                     action = f'"{os.path.abspath(sys.executable)}" "{os.path.abspath(sys.argv[0])}" --background'
-                # shell=False + liste: path'de bosluk olsa bile guvenli
-                result = subprocess.run(
+                result = run_cmd(
                     [
                         "schtasks", "/create",
                         "/tn", task_name,
@@ -830,37 +975,19 @@ class ITUApp:
                         "/rl", "highest",
                         "/f",
                     ],
-                    capture_output=True, text=True, timeout=20,
-                    creationflags=0x08000000
+                    timeout=20, label="schtasks-create",
                 )
                 if result.returncode == 0:
-                    logging.info(f"Task Scheduler entry created: {action}")
-                else:
-                    logging.error(f"Task Scheduler create failed: {result.stderr.strip() or result.stdout.strip()}")
+                    logging.info("Görev Zamanlayıcı başlangıç kaydı güncellendi.")
             else:
-                result = subprocess.run(
+                result = run_cmd(
                     ["schtasks", "/delete", "/tn", task_name, "/f"],
-                    capture_output=True, text=True, timeout=20,
-                    creationflags=0x08000000
+                    timeout=20, label="schtasks-delete",
                 )
                 if result.returncode == 0:
-                    logging.info("Task Scheduler entry removed.")
-                else:
-                    logging.warning(f"Task Scheduler delete failed: {result.stderr.strip() or result.stdout.strip()}")
-        except (OSError, subprocess.TimeoutExpired) as e:
-            logging.error(f"Task Scheduler error: {e}")
-
-    def set_icon_via_win32(self):
-        if not self.window:
-            return
-        try:
-            hwnd  = ctypes.windll.user32.GetParent(self.window.winfo_id())
-            hicon = self.icon_photo.tk.call("image", "get", self.icon_photo.name, "-handle")
-            ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon)
-            ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG,   hicon)
-            self.window.wm_iconphoto(True, self.icon_photo)
-        except Exception:
-            pass
+                    logging.info("Görev Zamanlayıcı başlangıç kaydı kaldırıldı.")
+        except Exception as e:
+            logging.error(f"Görev Zamanlayıcı hatası: {e}")
 
     def show_dashboard(self, silent=False):
         if self.window:
@@ -882,7 +1009,10 @@ class ITUApp:
 
         if self.tray_img:
             self.icon_photo = ImageTk.PhotoImage(self.tray_img)
-            self.window.after(100, self.set_icon_via_win32)
+            try:
+                self.window.wm_iconphoto(True, self.icon_photo)
+            except Exception:
+                pass
 
         # --- UI ---
         ctk.CTkLabel(
@@ -915,7 +1045,7 @@ class ITUApp:
         ).pack(pady=5)
         ctk.CTkButton(
             self.window, text="Open Logs", fg_color="gray",
-            command=lambda: os.startfile(LOG_PATH)
+            command=self.handle_open_logs
         ).pack(pady=5)
         ctk.CTkButton(
             self.window, text="Settings", fg_color="#444", command=self.open_settings
@@ -962,13 +1092,22 @@ class ITUApp:
             target=self.worker.reset_adapter_logic, args=(True,), daemon=True
         ).start()
 
+    def handle_open_logs(self):
+        try:
+            os.startfile(LOG_PATH)
+        except OSError as e:
+            logging.error(f"Log dosyası açılamadı: {e}")
+
     def open_settings(self):
         win = ctk.CTkToplevel(self.window)
         win.title("Settings")
         win.geometry("320x420")
         win.attributes("-topmost", True)
         if self.icon_photo:
-            win.wm_iconphoto(True, self.icon_photo)
+            try:
+                win.wm_iconphoto(True, self.icon_photo)
+            except Exception:
+                pass
 
         fields = {}
         schema = [
@@ -997,17 +1136,18 @@ class ITUApp:
                     raw = fields[key].get().strip()
                     if key == "adapter_name":
                         if not raw:
-                            raise ValueError("Adapter Name bos birakilamaz.")
+                            raise ValueError("Adapter Name boş bırakılamaz.")
                         new_data[key] = raw
                     else:
                         val = int(raw)
                         if val <= 0:
-                            raise ValueError(f"'{key}' pozitif bir tam sayi olmali.")
+                            raise ValueError(f"'{key}' pozitif bir tam sayı olmalı.")
                         new_data[key] = val
                 new_data["auto_start"] = auto_var.get()
                 self.config.data.update(new_data)
                 self.config.save()
                 self.worker.setup_logging()
+                logging.info(f"Ayarlar güncellendi: {new_data}")
                 threading.Thread(
                     target=self.manage_task_scheduler,
                     args=(new_data["auto_start"],),
@@ -1017,7 +1157,7 @@ class ITUApp:
             except ValueError as e:
                 error_lbl.configure(text=str(e))
             except OSError as e:
-                error_lbl.configure(text=f"Kaydetme hatasi: {e}")
+                error_lbl.configure(text=f"Kaydetme hatası: {e}")
 
         ctk.CTkButton(win, text="Save & Apply", command=save, fg_color="green").pack(pady=10)
 
@@ -1026,7 +1166,8 @@ class ITUApp:
             self.window.withdraw()
 
     def exit_app(self, *_):
-        self.worker.running = False   # _running.clear() -> wait() aninda uyanir
+        logging.info("Çıkış yapılıyor...")
+        self.worker.running = False
         self.tray_icon.stop()
         if self.window:
             if threading.current_thread() is threading.main_thread():
@@ -1041,12 +1182,26 @@ class ITUApp:
             self.window = None
 
 # ==============================================================================
+# 8. STARTUP BANNER
+# ==============================================================================
+def log_startup_banner(config):
+    logging.info("=" * 70)
+    logging.info(f"ITU Net Assistant v{APP_VERSION} başlatıldı")
+    logging.info(f"İzlenen Adaptör: '{config.data['adapter_name']}' | Kontrol Aralığı: {config.data['check_interval']}s")
+
+# ==============================================================================
 # ENTRY POINT
 # ==============================================================================
 if __name__ == "__main__":
+    config = Config()
+    setup_logging(config.data["log_max_mb"])
+    log_startup_banner(config)
+
     if not check_single_instance():
         sys.exit()
 
-    app           = ITUApp()
+    atexit.register(lambda: logging.info("Program kapandı."))
+
+    app           = ITUApp(config)
     is_background = "--background" in sys.argv
     app.show_dashboard(silent=is_background)
