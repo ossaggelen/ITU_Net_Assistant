@@ -18,7 +18,7 @@ from PIL import Image, ImageDraw, ImageTk
 import pystray
 from pystray import MenuItem as item
 
-APP_VERSION = "2026.10.22"
+APP_VERSION = "2026.10.30"
 
 # ==============================================================================
 # 1. WINDOWS IDENTITY
@@ -238,6 +238,31 @@ try:
 except Exception:
     _advapi32 = None
 
+SC_MANAGER_CONNECT   = 0x0001
+SERVICE_QUERY_STATUS = 0x0004
+SERVICE_RUNNING      = 4
+
+def is_service_running(service_name):
+    """Windows servisinin RUNNING (4) durumunda olup olmadigini C-API ile (<0.05ms, 0 process) sorgular."""
+    if not _advapi32:
+        return None
+    scm = _advapi32.OpenSCManagerW(None, None, SC_MANAGER_CONNECT)
+    if not scm:
+        return None
+    try:
+        svc = _advapi32.OpenServiceW(scm, service_name, SERVICE_QUERY_STATUS)
+        if not svc:
+            return None
+        try:
+            status = _SERVICE_STATUS()
+            if not _advapi32.QueryServiceStatus(svc, ctypes.byref(status)):
+                return None
+            return status.dwCurrentState == SERVICE_RUNNING
+        finally:
+            _advapi32.CloseServiceHandle(svc)
+    finally:
+        _advapi32.CloseServiceHandle(scm)
+
 # ==============================================================================
 # 4.2 WINDOWS NETWORK IPHLPAPI DEFINITIONS
 # ==============================================================================
@@ -418,10 +443,11 @@ class Config:
 # 6. NETWORK WORKER
 # ==============================================================================
 class NetworkWorker:
-    HOTSPOT_ON_INTERVAL    = 60  # Hotspot 'On' iken kontrol periyodu (CPU/işlem tasarrufu)
-    HOTSPOT_OFF_INTERVAL   = 10  # Hotspot kapalıyken veya bilinmiyorken kontrol periyodu
-    HOTSPOT_RETRY_INTERVAL = 10
-    HOTSPOT_MAX_BACKOFF    = 120
+    HOTSPOT_ON_INTERVAL        = 15  # Hotspot 'On' iken sıfır-süreç (C-API + DNS soket) sağlık kontrol periyodu
+    HOTSPOT_OFF_INTERVAL       = 10  # Hotspot kapalıyken veya bilinmiyorken kontrol periyodu
+    HOTSPOT_RETRY_INTERVAL     = 10
+    HOTSPOT_MAX_BACKOFF        = 120
+    HOTSPOT_SHARING_FAIL_LIMIT = 2   # Kaç ardışık paylaşım/DNS hatasında hotspot yeniden başlatılsın
 
     FAILS_BEFORE_RESET = 3
     POST_ACTION_GRACE  = 30
@@ -452,11 +478,16 @@ class NetworkWorker:
         self._status_lock = threading.Lock()
 
         # Hotspot
-        self._hotspot_last_check    = 0.0
-        self._hotspot_failures      = 0
-        self._hotspot_backoff_until = 0.0
-        self._hotspot_last_state    = None
-        self._wifi_hw_present       = None
+        self._hotspot_last_check           = 0.0
+        self._hotspot_failures             = 0
+        self._hotspot_backoff_until        = 0.0
+        self._hotspot_last_state           = None
+        self._wifi_hw_present              = None
+        self._hotspot_needs_restart        = None
+        self._hotspot_sharing_failures     = 0
+        self._hotspot_dns_verified         = False
+        self._hotspot_unverified_restarted = False
+        self._hotspot_virtual_ip           = None
 
         # Reset & Baglanti
         self._consecutive_failures = 0
@@ -528,6 +559,9 @@ class NetworkWorker:
                 if is_up and ip and ip != self._last_adapter_ip:
                     if self._last_adapter_ip is not None:
                         logging.info(f"Ethernet IP adresi değişti: {self._last_adapter_ip} -> {ip}")
+                        if self._hotspot_last_state == "On":
+                            self._hotspot_needs_restart = f"Ethernet IP adresi değişti ({self._last_adapter_ip} -> {ip})"
+                            self._hotspot_last_check    = 0.0
                     self._last_adapter_ip = ip
                 return is_up, ip
         return False, None
@@ -584,10 +618,11 @@ class NetworkWorker:
                     return f"Gateway ({gw}) pinglenemedi"
         return "Adaptör bilgisi alınamadı"
 
-    def has_wifi_hardware(self):
+    def has_wifi_hardware(self, adapters=None):
         if not _iphlpapi:
             return True
-        adapters = enumerate_adapters()
+        if adapters is None:
+            adapters = enumerate_adapters()
         if adapters is None:
             return True
         wifi = [
@@ -596,32 +631,250 @@ class NetworkWorker:
         ]
         return bool(wifi)
 
-    def _query_hotspot_state(self):
+    def get_hotspot_virtual_adapter(self, adapters=None):
+        """
+        Hotspot sanal Wi-Fi Direct adaptörünü C-API ile (<0.2ms, 0 process) bulur.
+        Dönüş: (is_up: bool, hotspot_ip: str | None, adapter_name: str | None)
+        """
+        if not _iphlpapi:
+            return False, None, None
+        if adapters is None:
+            adapters = enumerate_adapters()
+        if not adapters:
+            return False, None, None
+
+        virtuals = [
+            a for a in adapters
+            if a["if_type"] == IF_TYPE_IEEE80211 and "wi-fi direct" in a["description"].lower()
+        ]
+        # 1. Öncelik: Up durumunda ve standart ICS (192.168.137.x) IP'sine sahip olan
+        for a in virtuals:
+            if a["oper_status"] == 1 and a["ipv4"]:
+                for ip in a["ipv4"]:
+                    if ip.startswith("192.168.137."):
+                        return True, ip, a["name"]
+        # 2. Öncelik: Up durumunda ve herhangi bir geçerli IPv4 adresine sahip olan
+        for a in virtuals:
+            if a["oper_status"] == 1 and a["ipv4"]:
+                return True, a["ipv4"][0], a["name"]
+        # 3. Öncelik: Up durumunda ancak IP adresini kaybetmiş (veya APIPA'ya düşmüş) olan
+        for a in virtuals:
+            if a["oper_status"] == 1:
+                return True, None, a["name"]
+
+        return False, None, None
+
+    @staticmethod
+    def _build_dns_query(domain):
+        txid = os.urandom(2)
+        header = txid + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+        qname = b"".join(
+            bytes([len(label)]) + label.encode("ascii")
+            for label in domain.split(".") if label
+        ) + b"\x00"
+        return txid, header + qname + b"\x00\x01\x00\x01"
+
+    @staticmethod
+    def _is_valid_dns_reply(resp, txid, allow_nxdomain=False):
+        if not resp or len(resp) < 12 or resp[:2] != txid:
+            return False
+        if (resp[2] & 0x80) == 0:  # QR bit (1 = Response)
+            return False
+        rcode   = resp[3] & 0x0F
+        ancount = int.from_bytes(resp[6:8], "big")
+        nscount = int.from_bytes(resp[8:10], "big")
+        if rcode == 0 and ancount >= 1:
+            return True
+        if allow_nxdomain and rcode == 3 and nscount >= 1:
+            return True
+        return False
+
+    def _probe_hotspot_sharing(self, hotspot_ip):
+        """
+        Hotspot sanal adaptör IP'si (örn. 192.168.137.1:53) üzerindeki Windows ICS DNS/NAT
+        köprüsüne gerçek bir DNS sorgusu göndererek bağlı cihazlara internet gidip gitmediğini
+        test eder (~2-15 ms, 0 process, ~38 byte).
+        """
+        nonce = int(time.time() * 1000) & 0xFFFF
+        queries = [
+            (f"chk-{nonce:04x}.cloudflare.com", True),  # Önbelleğe takılmaz, canlı upstream iletimini kanıtlar
+            ("one.one.one.one", False),                 # Yedek standart A kaydı sorgusu
+        ]
+        for domain, allow_nx in queries:
+            txid, packet = self._build_dns_query(domain)
+            # 1) UDP 53 (en hızlı yol)
+            s = None
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(1.5)
+                s.bind((hotspot_ip, 0))
+                s.sendto(packet, (hotspot_ip, 53))
+                resp, _ = s.recvfrom(512)
+                if self._is_valid_dns_reply(resp, txid, allow_nxdomain=allow_nx):
+                    return True
+            except OSError:
+                pass
+            finally:
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+
+            # 2) TCP 53 yedek kontrolü
+            s = None
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1.5)
+                s.bind((hotspot_ip, 0))
+                s.connect((hotspot_ip, 53))
+                tcp_pkt = len(packet).to_bytes(2, "big") + packet
+                s.sendall(tcp_pkt)
+                hdr = s.recv(2)
+                if len(hdr) == 2:
+                    length = int.from_bytes(hdr, "big")
+                    resp = s.recv(min(length, 512))
+                    if self._is_valid_dns_reply(resp, txid, allow_nxdomain=allow_nx):
+                        return True
+            except OSError:
+                pass
+            finally:
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+        return False
+
+    def _check_hotspot_health(self):
+        """
+        PowerShell çalıştırmadan (<10ms, 0 process) Hotspot'un gerçekten açık olduğunu,
+        sanal adaptörün IP'sinin korunduğunu, icssvc + SharedAccess (ICS) servislerinin
+        çalıştığını ve internet paylaşımının (DNS/NAT) yanıt verdiğini doğrular.
+        Dönüş: (is_healthy: bool, needs_restart: bool, reason: str)
+        """
+        v_up, v_ip, v_name = self.get_hotspot_virtual_adapter()
+        if not v_up:
+            self._hotspot_virtual_ip = None
+            return False, False, "Hotspot sanal adaptörü kapalı"
+
+        if not v_ip:
+            self._hotspot_virtual_ip = None
+            return False, True, f"Hotspot açık görünüyor ancak sanal adaptör ('{v_name}') IP adresini kaybetti"
+
+        self._hotspot_virtual_ip = v_ip
+
+        if is_service_running("icssvc") is False:
+            return False, True, "icssvc (Mobil Etkin Nokta) servisi çalışmıyor"
+
+        if is_service_running("SharedAccess") is False:
+            return False, True, "SharedAccess (ICS İnternet Paylaşımı) servisi çalışmıyor"
+
+        if self._probe_hotspot_sharing(v_ip):
+            if not self._hotspot_dns_verified:
+                self._hotspot_dns_verified = True
+                logging.info(f"Hotspot internet paylaşımı (ICS/DNS köprüsü) doğrulandı (Gateway: {v_ip}).")
+            elif self._hotspot_sharing_failures > 0:
+                logging.info(f"Hotspot internet paylaşımı kendiliğinden normale döndü (Gateway: {v_ip}).")
+            self._hotspot_sharing_failures = 0
+            return True, False, "OK"
+
+        # Ethernet'in kendisinde o an internet yoksa Hotspot'u suçlama
+        if self.status != Status.ACTIVE:
+            return True, False, "Ethernet interneti bekleniyor"
+
+        self._hotspot_sharing_failures += 1
+        n = self._hotspot_sharing_failures
+
+        if self._hotspot_dns_verified:
+            if n >= self.HOTSPOT_SHARING_FAIL_LIMIT:
+                return (
+                    False,
+                    True,
+                    f"Hotspot açık ancak internet paylaşımı (ICS/DNS {v_ip}:53) yanıt vermiyor ({n}/{self.HOTSPOT_SHARING_FAIL_LIMIT})",
+                )
+            logging.warning(f"Hotspot internet paylaşım testi başarısız ({n}/{self.HOTSPOT_SHARING_FAIL_LIMIT}, Gateway: {v_ip}). Tekrar kontrol edilecek...")
+            return True, False, "Paylaşım tekrar denenecek"
+
+        # Henüz bu oturumda DNS yanıtı doğrulanmadıysa en fazla 1 kez onarım amaçlı restart dene (güvenlik duvarı sonsuz döngü koruması)
+        if not self._hotspot_unverified_restarted and n >= self.HOTSPOT_SHARING_FAIL_LIMIT + 1:
+            self._hotspot_unverified_restarted = True
+            return (
+                False,
+                True,
+                f"Hotspot ICS/DNS paylaşım köprüsü ({v_ip}:53) yanıt vermedi -> paylaşım köprüsü tazeleniyor",
+            )
+        return True, False, "OK"
+
+    def _recover_hotspot_services(self):
+        """icssvc veya SharedAccess kilitlendiğinde servisleri temiz şekilde yeniden başlatır."""
+        logging.warning("Hotspot servisleri (icssvc / SharedAccess) yanıt vermiyor -> servisler yeniden başlatılıyor...")
+        try:
+            run_cmd(["net", "stop", "icssvc", "/y"], timeout=12, label="net-stop-icssvc")
+        except Exception:
+            try:
+                run_cmd(["taskkill", "/F", "/FI", "SERVICES eq icssvc"], timeout=8, label="kill-hung-icssvc")
+            except Exception:
+                pass
+        time.sleep(1.5)
+        for svc in ("SharedAccess", "icssvc"):
+            if is_service_running(svc) is False:
+                try:
+                    run_cmd(["net", "start", svc], timeout=12, label=f"net-start-{svc}")
+                except Exception:
+                    pass
+
+    def _start_or_restart_hotspot_ps(self, force_restart=False):
+        """
+        Tek bir PowerShell çağrısıyla Hotspot'u başlatır veya (açık görünse bile)
+        kapatıp yeniden açarak ICS/NAT köprüsünü tazeler.
+        """
+        force_flag = "$true" if force_restart else "$false"
         ps_script = (
             "$ErrorActionPreference = 'Stop'; "
+            f"$forceRestart = {force_flag}; "
             "$cp = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType = WindowsRuntime]::GetInternetConnectionProfile(); "
             "if (-not $cp) { Write-Output 'NO_PROFILE'; exit 0 }; "
             "$tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType = WindowsRuntime]::CreateFromConnectionProfile($cp); "
             "if (-not $tm) { Write-Output 'NO_MANAGER'; exit 0 }; "
-            "Write-Output $tm.TetheringOperationalState.ToString()"
+            "Add-Type -AssemblyName System.Runtime.WindowsRuntime; "
+            "$ext = [System.WindowsRuntimeSystemExtensions]; "
+            "$asTaskMethod = ($ext.GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]; "
+            "$asTask = $asTaskMethod.MakeGenericMethod([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult]); "
+            "$state = $tm.TetheringOperationalState.ToString(); "
+            "if ($state -eq 'InTransition') { Write-Output 'IN_TRANSITION'; exit 0 }; "
+            "if ($state -eq 'On') { "
+            "    if (-not $forceRestart) { "
+            "        $stopOp = $tm.StopTetheringAsync(); "
+            "        $stopTask = $asTask.Invoke($null, @($stopOp)); "
+            "        [void]$stopTask.Wait(15000); "
+            "        Start-Sleep -Milliseconds 1500; "
+            "    } else { "
+            "        $stopOp = $tm.StopTetheringAsync(); "
+            "        $stopTask = $asTask.Invoke($null, @($stopOp)); "
+            "        [void]$stopTask.Wait(15000); "
+            "        Start-Sleep -Milliseconds 1500; "
+            "    } "
+            "}; "
+            "$op = $tm.StartTetheringAsync(); "
+            "$task = $asTask.Invoke($null, @($op)); "
+            "if (-not $task.Wait(30000)) { throw 'Start_timed_out' }; "
+            "$result = $task.Result; "
+            "if ($result.Status.ToString() -eq 'Success') { "
+            "    if ($state -eq 'On' -or $forceRestart) { Write-Output 'RESTARTED' } else { Write-Output 'STARTED' } "
+            "} else { throw ('Start_failed: ' + $result.Status.ToString()) }"
         )
-        try:
-            result = run_cmd(
-                ["powershell", "-NoLogo", "-NoProfile", "-NonInteractive",
-                 "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
-                 "-Command", ps_script],
-                timeout=8, label="ps-hotspot-state",
-            )
-        except Exception:
-            return None
-        if result.returncode != 0:
-            return None
-        lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
-        return lines[-1] if lines else None
+        return run_cmd(
+            ["powershell", "-NoLogo", "-NoProfile", "-NonInteractive",
+             "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+             "-Command", ps_script],
+            timeout=45, label="ps-hotspot-manage",
+        )
 
     def manage_hotspot(self, force=False):
         now = time.time()
-        wifi = self.has_wifi_hardware()
+        adapters = enumerate_adapters()
+        wifi = self.has_wifi_hardware(adapters=adapters)
         if wifi != self._wifi_hw_present:
             if wifi:
                 logging.info("Kullanılabilir Wi-Fi bağdaştırıcısı algılandı. Hotspot yönetimi devrede.")
@@ -633,12 +886,15 @@ class NetworkWorker:
         if not wifi:
             return
 
-        if now < self._hotspot_backoff_until:
+        if not force and now < self._hotspot_backoff_until:
             return
 
-        # Hotspot zaten On ise seyrek kontrol et (60s), kapaliysa hizla acabilmek icin sik kontrol et (10s)
-        interval = self.HOTSPOT_ON_INTERVAL if self._hotspot_last_state == "On" else self.HOTSPOT_OFF_INTERVAL
-        if not force and (now - self._hotspot_last_check < interval):
+        interval = (
+            self.HOTSPOT_ON_INTERVAL
+            if (self._hotspot_last_state == "On" and not self._hotspot_needs_restart)
+            else self.HOTSPOT_OFF_INTERVAL
+        )
+        if not force and not self._hotspot_needs_restart and (now - self._hotspot_last_check < interval):
             return
         if not self._hotspot_lock.acquire(blocking=False):
             return
@@ -648,64 +904,67 @@ class NetworkWorker:
 
     def _hotspot_worker(self):
         try:
-            state = self._query_hotspot_state()
-            if state != self._hotspot_last_state:
-                if state in ("On", "Off"):
-                    # Sadece Off iken veya On'a dondugunde bilgi ver
-                    if state == "Off" and self._hotspot_last_state == "On":
-                        logging.warning("Mobil Etkin Nokta kapandı -> tekrar açılacak.")
-                self._hotspot_last_state = state
+            restart_reason = self._hotspot_needs_restart
+            needs_restart  = bool(restart_reason)
 
-            if state == "On":
-                self._hotspot_failures      = 0
-                self._hotspot_backoff_until = 0.0
-                return
+            if not needs_restart:
+                healthy, health_restart, reason = self._check_hotspot_health()
+                if healthy:
+                    if self._hotspot_last_state != "On":
+                        logging.info(f"Mobil Etkin Nokta (Hotspot) aktif ve internet paylaşımı sağlıklı (Gateway: {self._hotspot_virtual_ip}).")
+                    self._hotspot_last_state    = "On"
+                    self._hotspot_failures      = 0
+                    self._hotspot_backoff_until = 0.0
+                    return
 
-            if state != "Off":
-                # InTransition vb. durumlarda bekle
-                self._hotspot_failures += 1
-                delay = min(self.HOTSPOT_RETRY_INTERVAL * (2 ** (self._hotspot_failures - 1)), self.HOTSPOT_MAX_BACKOFF)
-                self._hotspot_backoff_until = time.time() + delay
-                return
+                if health_restart:
+                    needs_restart  = True
+                    restart_reason = reason
+                elif self._hotspot_last_state == "On":
+                    logging.warning(f"Mobil Etkin Nokta kapandı ({reason}) -> tekrar açılacak.")
+                    self._hotspot_last_state = "Off"
 
-            # Off -> Başlat
-            self._set_grace("hotspot açılıyor")
-            ps_script = (
-                "$ErrorActionPreference = 'Stop'; "
-                "$cp = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType = WindowsRuntime]::GetInternetConnectionProfile(); "
-                "if (-not $cp) { Write-Output 'NO_PROFILE'; exit 0 }; "
-                "$tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType = WindowsRuntime]::CreateFromConnectionProfile($cp); "
-                "if ($tm.TetheringOperationalState.ToString() -eq 'On') { Write-Output 'ALREADY_ON'; exit 0 }; "
-                "Add-Type -AssemblyName System.Runtime.WindowsRuntime; "
-                "$ext = [System.WindowsRuntimeSystemExtensions]; "
-                "$asTaskMethod = ($ext.GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]; "
-                "$op = $tm.StartTetheringAsync(); "
-                "$asTask = $asTaskMethod.MakeGenericMethod([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult]); "
-                "$task = $asTask.Invoke($null, @($op)); "
-                "if (-not $task.Wait(30000)) { throw 'Start_timed_out' }; "
-                "$result = $task.Result; "
-                "if ($result.Status.ToString() -eq 'Success') { Write-Output 'STARTED' } "
-                "else { throw ('Start_failed: ' + $result.Status.ToString()) }"
-            )
-            result = run_cmd(
-                ["powershell", "-NoLogo", "-NoProfile", "-NonInteractive",
-                 "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
-                 "-Command", ps_script],
-                timeout=35, label="ps-hotspot-start"
-            )
-            if "STARTED" in result.stdout or "ALREADY_ON" in result.stdout:
-                logging.info("Mobil Etkin Nokta (Hotspot) kapalıydı -> başarıyla başlatıldı.")
-                self._hotspot_failures      = 0
-                self._hotspot_backoff_until = 0.0
-                self._hotspot_last_state    = "On"
+            if needs_restart:
+                logging.warning(f"Hotspot internet paylaşımı yenileniyor (Sebep: {restart_reason})...")
+
+            self._set_grace("hotspot başlatılıyor/yenileniyor")
+            result = None
+            try:
+                result = self._start_or_restart_hotspot_ps(force_restart=needs_restart)
+            except subprocess.TimeoutExpired:
+                self._recover_hotspot_services()
+                result = self._start_or_restart_hotspot_ps(force_restart=True)
+
+            out = (result.stdout or "") if result else ""
+            if "STARTED" in out or "RESTARTED" in out:
+                self._hotspot_needs_restart        = None
+                self._hotspot_failures             = 0
+                self._hotspot_backoff_until        = 0.0
+                self._hotspot_sharing_failures     = 0
+                self._hotspot_dns_verified         = False
+                if " STARTED" in f" {out}" and not needs_restart:
+                    self._hotspot_unverified_restarted = False
+                    logging.info("Mobil Etkin Nokta (Hotspot) kapalıydı -> başarıyla başlatıldı.")
+                else:
+                    logging.info("Mobil Etkin Nokta (Hotspot) ve ICS internet paylaşım köprüsü başarıyla yeniden başlatıldı.")
+                self._hotspot_last_state = "On"
+                self._hotspot_last_check = time.time()
                 self._set_grace("hotspot başlatıldı")
+            elif "IN_TRANSITION" in out:
+                self._hotspot_failures += 1
+                self._hotspot_backoff_until = time.time() + self.HOTSPOT_RETRY_INTERVAL
             else:
                 self._hotspot_failures += 1
+                if self._hotspot_failures >= 2:
+                    self._recover_hotspot_services()
                 delay = min(self.HOTSPOT_RETRY_INTERVAL * (2 ** (self._hotspot_failures - 1)), self.HOTSPOT_MAX_BACKOFF)
                 self._hotspot_backoff_until = time.time() + delay
-                logging.error(f"Mobil Etkin Nokta başlatılamadı ({_one_line(result.stderr or result.stdout)}). {delay}s sonra tekrar denenecek.")
+                err_msg = _one_line((result.stderr or result.stdout) if result else "Bilinmeyen hata")
+                logging.error(f"Mobil Etkin Nokta başlatılamadı ({err_msg}). {delay}s sonra tekrar denenecek.")
         except Exception as e:
             self._hotspot_failures += 1
+            if self._hotspot_failures >= 2:
+                self._recover_hotspot_services()
             self._hotspot_backoff_until = time.time() + self.HOTSPOT_RETRY_INTERVAL
             logging.error(f"Hotspot işlemi sırasında hata: {e}")
         finally:
@@ -788,6 +1047,8 @@ class NetworkWorker:
                 self._reset_lock.release()
 
         if restored:
+            if self._hotspot_last_state == "On":
+                self._hotspot_needs_restart = f"'{adapter}' adaptörü resetlendi (ICS köprüsü tazeleme)"
             self._hotspot_last_check    = 0.0
             self._hotspot_backoff_until = 0.0
             self.manage_hotspot(force=True)
@@ -827,6 +1088,7 @@ class NetworkWorker:
             if self._consecutive_failures or self._first_failure_at:
                 outage = int(now - self._first_failure_at) if self._first_failure_at else 0
                 logging.info(f"Bağlantı reset gerekmeden kendiliğinden düzeldi (~{outage}s kesinti sonrasında).")
+                self._hotspot_last_check = 0.0
             self._consecutive_failures = 0
             self._first_failure_at     = None
             if self._healthy_since is None:
