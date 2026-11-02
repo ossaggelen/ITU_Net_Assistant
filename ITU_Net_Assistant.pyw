@@ -18,7 +18,7 @@ from PIL import Image, ImageDraw, ImageTk
 import pystray
 from pystray import MenuItem as item
 
-APP_VERSION = "2026.11.03"
+APP_VERSION = "2026.11.03.1"
 
 # ==============================================================================
 # 1. WINDOWS IDENTITY
@@ -361,8 +361,55 @@ try:
             ("sin_addr", ctypes.c_ubyte * 4),
             ("sin_zero", ctypes.c_char * 8),
         ]
+
+    class _MIB_IPNETROW(ctypes.Structure):
+        _fields_ = [
+            ("dwIndex", wintypes.DWORD),
+            ("dwPhysAddrLen", wintypes.DWORD),
+            ("bPhysAddr", ctypes.c_ubyte * 8),
+            ("dwAddr", wintypes.DWORD),
+            ("dwType", wintypes.DWORD),
+        ]
+
+    class _MIB_IPNETTABLE(ctypes.Structure):
+        _fields_ = [
+            ("dwNumEntries", wintypes.DWORD),
+            ("table", _MIB_IPNETROW * 1),
+        ]
 except Exception:
     _iphlpapi = None
+
+def get_hotspot_clients_count(prefix="192.168.137."):
+    """
+    ARP tablosunu doğrudan C API (iphlpapi.GetIpNetTable) ile okuyarak
+    Hotspot alt ağındaki bağlı aktif istemcileri döndürür (<0.1ms, 0 process).
+    """
+    if not _iphlpapi:
+        return 0, []
+    try:
+        size = wintypes.ULONG(0)
+        _iphlpapi.GetIpNetTable(None, ctypes.byref(size), False)
+        if size.value == 0:
+            return 0, []
+        buf = ctypes.create_string_buffer(size.value)
+        ret = _iphlpapi.GetIpNetTable(ctypes.cast(buf, ctypes.c_void_p), ctypes.byref(size), False)
+        if ret != 0:
+            return 0, []
+        table = ctypes.cast(buf, ctypes.POINTER(_MIB_IPNETTABLE)).contents
+        count = 0
+        clients = []
+        for i in range(table.dwNumEntries):
+            row = _MIB_IPNETROW.from_address(ctypes.addressof(table.table) + i * ctypes.sizeof(_MIB_IPNETROW))
+            ip_bytes = row.dwAddr.to_bytes(4, "little")
+            ip_str = socket.inet_ntoa(ip_bytes)
+            # dwType: 3 = dynamic, 4 = static, 2 = invalid
+            if ip_str.startswith(prefix) and not ip_str.endswith(".1") and not ip_str.endswith(".255"):
+                if row.dwType in (3, 4):
+                    count += 1
+                    clients.append(ip_str)
+        return count, clients
+    except Exception:
+        return 0, []
 
 def _sockaddr_to_ipv4(sock_address):
     ptr = sock_address.lpSockaddr
@@ -875,7 +922,7 @@ class NetworkWorker:
     def _keepalive_and_check_wifi_radio(self):
         """
         Wi-Fi PCIe kartını uyanık tutar (D0 keepalive / RTD3 uyku önleme) ve
-        radyonun donup donmadığını test eder (~2-10 ms, 0 process).
+        radyo sürücüsünün C API'ye yanıt verip vermediğini test eder (~1-2 ms, 0 process).
         Dönüş: (is_healthy: bool, reason: str)
         """
         info = get_wifi_interface_info()
@@ -884,28 +931,24 @@ class NetworkWorker:
         h, guid_bytes, desc = info
         try:
             guid_buf = (wintypes.BYTE * 16)(*guid_bytes)
-            # 1) Light keepalive scan tetikle (0.2 ms - kartı D0 uyanık tutar)
+            # 1) Light keepalive scan tetikle (0.2 ms - PCIe veriyolunu D0 uyanık tutar)
             _wlanapi.WlanScan(h, ctypes.byref(guid_buf), None, None, None)
-            # 2) Mevcut görünür ağ sayısını kontrol et
+            # 2) WLAN sürücüsünün yanıt verip vermediğini C API seviyesinde test et
             p_net = ctypes.c_void_p()
             ret = _wlanapi.WlanGetAvailableNetworkList(h, ctypes.byref(guid_buf), 0, None, ctypes.byref(p_net))
             if ret != 0:
-                return False, f"Wi-Fi radyo sorgusu başarısız oldu (Hata: {ret})"
-            if not p_net:
-                return True, "OK"
-            net_list = ctypes.cast(p_net, ctypes.POINTER(_WLAN_AVAILABLE_NETWORK_LIST)).contents
-            count = net_list.dwNumberOfItems
-
-            if count > 0:
-                self._wifi_last_seen_networks = count
-                self._wifi_dead_streak = 0
-                return True, "OK"
-
-            # Eğer daha önce ağlar görünüyorken aniden 0'a düştüyse kart uykuya girmiş veya donmuş olabilir
-            if self._wifi_last_seen_networks > 0:
                 self._wifi_dead_streak += 1
                 if self._wifi_dead_streak >= 3:
-                    return False, f"Wi-Fi kartı radyo yayınını kaybetti ({self._wifi_last_seen_networks} ağdan 0'a düştü / RTD3 kilitlenmesi)"
+                    return False, f"Wi-Fi radyo sürücüsü yanıt vermiyor (C API Hata: {ret})"
+                return True, "Driver transient error"
+            if p_net:
+                try:
+                    _wlanapi.WlanFreeMemory(p_net)
+                except Exception:
+                    pass
+            self._wifi_dead_streak = 0
+            return True, "OK"
+        except Exception:
             return True, "OK"
         finally:
             _wlanapi.WlanCloseHandle(h, None)
@@ -942,6 +985,17 @@ class NetworkWorker:
             elif self._hotspot_sharing_failures > 0:
                 logging.info(f"Hotspot internet paylaşımı kendiliğinden normale döndü (Gateway: {v_ip}).")
             self._hotspot_sharing_failures = 0
+
+            # 0) Aktif bağlı istemci var mı? (Telefon, tablet vb.)
+            prefix = v_ip.rsplit(".", 1)[0] + "."
+            client_count, clients = get_hotspot_clients_count(prefix=prefix)
+            if client_count > 0:
+                # İstemciler aktif olarak bağlı ve internet paylaşımı doğrulanmış.
+                # Bağlantıyı asla kesme ve reset atma!
+                self._wifi_dead_streak = 0
+                self._hotspot_security_stopped_since = None
+                self._keepalive_and_check_wifi_radio()
+                return True, False, "OK"
 
             # 1) Wi-Fi radyo keepalive (RTD3 uyku engelleme) ve canlılık kontrolü
             radio_ok, radio_err = self._keepalive_and_check_wifi_radio()
