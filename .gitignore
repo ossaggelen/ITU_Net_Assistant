@@ -1,5 +1,6 @@
 # Dağıtım ve derleme çıktıları (Build/Binary)
 *.exe
+*.bat
 dist/
 build/
 *.msix
