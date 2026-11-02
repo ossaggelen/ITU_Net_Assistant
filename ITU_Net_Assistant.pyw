@@ -18,7 +18,7 @@ from PIL import Image, ImageDraw, ImageTk
 import pystray
 from pystray import MenuItem as item
 
-APP_VERSION = "2026.10.30"
+APP_VERSION = "2026.11.03"
 
 # ==============================================================================
 # 1. WINDOWS IDENTITY
@@ -202,12 +202,38 @@ if not is_admin():
 # 4.1 HOTSPOT REGISTRY & ADVAPI32 DEFINITIONS
 # ==============================================================================
 def configure_hotspot_registry():
-    """Windows'un cihaz bagli degilken hotspot'u otomatik kapatmasini onler."""
+    """Windows'un cihaz bagli degilken hotspot'u otomatik kapatmasini onler ve Wi-Fi kartinin uykuya girmesini engeller."""
     try:
         import winreg
         key_path = r"SYSTEM\CurrentControlSet\Services\icssvc\Settings"
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path, 0, winreg.KEY_SET_VALUE) as key:
             winreg.SetValueEx(key, "PeerlessTimeoutEnabled", 0, winreg.REG_DWORD, 0)
+    except Exception:
+        pass
+
+    # Realtek Wi-Fi PCIe kartinda PnP guc tasarrufunu devre disi birak (0x100 biti)
+    try:
+        import winreg
+        class_path = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}"
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, class_path) as root:
+            for i in range(100):
+                try:
+                    sub = winreg.EnumKey(root, i)
+                    sub_path = f"{class_path}\\{sub}"
+                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, sub_path, 0, winreg.KEY_READ | winreg.KEY_WRITE) as k:
+                        try:
+                            desc, _ = winreg.QueryValueEx(k, "DriverDesc")
+                            if "Realtek" in desc and ("WiFi" in desc or "Wireless" in desc or "802.11" in desc):
+                                try:
+                                    pnp, _ = winreg.QueryValueEx(k, "PnPCapabilities")
+                                except FileNotFoundError:
+                                    pnp = 0
+                                if not (pnp & 0x100):
+                                    winreg.SetValueEx(k, "PnPCapabilities", 0, winreg.REG_DWORD, pnp | 0x100)
+                        except (FileNotFoundError, OSError):
+                            pass
+                except OSError:
+                    break
     except Exception:
         pass
 
@@ -397,6 +423,103 @@ def enumerate_adapters():
     return adapters
 
 # ==============================================================================
+# 4.3 WLANAPI & WEVTAPI DEFINITIONS (WI-FI RADIO & EVENT HEALTH)
+# ==============================================================================
+try:
+    _wlanapi = ctypes.windll.wlanapi
+except Exception:
+    _wlanapi = None
+
+try:
+    _wevtapi = ctypes.windll.wevtapi
+except Exception:
+    _wevtapi = None
+
+class _WLAN_INTERFACE_INFO(ctypes.Structure):
+    _fields_ = [
+        ("InterfaceGuid", wintypes.BYTE * 16),
+        ("strInterfaceDescription", wintypes.WCHAR * 256),
+        ("isState", wintypes.DWORD),
+    ]
+
+class _WLAN_INTERFACE_INFO_LIST(ctypes.Structure):
+    _fields_ = [
+        ("dwNumberOfItems", wintypes.DWORD),
+        ("dwIndex", wintypes.DWORD),
+        ("InterfaceInfo", _WLAN_INTERFACE_INFO * 1),
+    ]
+
+class _WLAN_AVAILABLE_NETWORK_LIST(ctypes.Structure):
+    _fields_ = [
+        ("dwNumberOfItems", wintypes.DWORD),
+        ("dwIndex", wintypes.DWORD),
+    ]
+
+def get_wifi_interface_info():
+    """Birincil Wi-Fi bagdastiricisinin handle ve GUID bilgisini dondurur."""
+    if not _wlanapi:
+        return None
+    h = wintypes.HANDLE()
+    v = wintypes.DWORD()
+    if _wlanapi.WlanOpenHandle(2, None, ctypes.byref(v), ctypes.byref(h)) != 0:
+        return None
+    try:
+        p_list = ctypes.c_void_p()
+        if _wlanapi.WlanEnumInterfaces(h, None, ctypes.byref(p_list)) != 0 or not p_list:
+            _wlanapi.WlanCloseHandle(h, None)
+            return None
+        info_list = ctypes.cast(p_list, ctypes.POINTER(_WLAN_INTERFACE_INFO_LIST)).contents
+        for i in range(info_list.dwNumberOfItems):
+            item = _WLAN_INTERFACE_INFO.from_address(ctypes.addressof(info_list.InterfaceInfo) + i * ctypes.sizeof(_WLAN_INTERFACE_INFO))
+            return h, bytes(item.InterfaceGuid), item.strInterfaceDescription
+        _wlanapi.WlanCloseHandle(h, None)
+        return None
+    except Exception:
+        _wlanapi.WlanCloseHandle(h, None)
+        return None
+
+def check_wlan_security_event_stopped():
+    """
+    Microsoft-Windows-WLAN-AutoConfig/Operational logundan son hosted network olayini okur (~1 ms).
+    Eger son olay 11004 (Wireless security stopped) veya 8008 ise True doner.
+    """
+    if not _wevtapi:
+        return False
+    query_str = "*[System[(EventID=11004 or EventID=11005 or EventID=8006 or EventID=8008)]]"
+    EvtQueryChannelPath = 0x1
+    EvtQueryReverseDirection = 0x200
+    hQuery = _wevtapi.EvtQuery(
+        None,
+        "Microsoft-Windows-WLAN-AutoConfig/Operational",
+        query_str,
+        EvtQueryChannelPath | EvtQueryReverseDirection
+    )
+    if not hQuery:
+        return False
+    try:
+        hEvents = (ctypes.c_void_p * 1)()
+        returned = wintypes.DWORD()
+        if not _wevtapi.EvtNext(hQuery, 1, hEvents, 500, 0, ctypes.byref(returned)) or returned.value == 0:
+            return False
+        hEvent = hEvents[0]
+        try:
+            buf_size = wintypes.DWORD(4096)
+            buf_used = wintypes.DWORD()
+            prop_count = wintypes.DWORD()
+            xml_buf = ctypes.create_unicode_buffer(4096)
+            EvtRenderEventXml = 1
+            if _wevtapi.EvtRender(None, hEvent, EvtRenderEventXml, buf_size.value * 2, xml_buf, ctypes.byref(buf_used), ctypes.byref(prop_count)):
+                xml = xml_buf.value
+                if "<EventID>11004</EventID>" in xml or "<EventID>8008</EventID>" in xml:
+                    return True
+                return False
+        finally:
+            _wevtapi.EvtClose(hEvent)
+    finally:
+        _wevtapi.EvtClose(hQuery)
+    return False
+
+# ==============================================================================
 # 5. CONFIG
 # ==============================================================================
 class Config:
@@ -488,6 +611,9 @@ class NetworkWorker:
         self._hotspot_dns_verified         = False
         self._hotspot_unverified_restarted = False
         self._hotspot_virtual_ip           = None
+        self._wifi_last_seen_networks      = -1
+        self._wifi_dead_streak             = 0
+        self._hotspot_security_stopped_since = None
 
         # Reset & Baglanti
         self._consecutive_failures = 0
@@ -746,11 +872,50 @@ class NetworkWorker:
                         pass
         return False
 
+    def _keepalive_and_check_wifi_radio(self):
+        """
+        Wi-Fi PCIe kartını uyanık tutar (D0 keepalive / RTD3 uyku önleme) ve
+        radyonun donup donmadığını test eder (~2-10 ms, 0 process).
+        Dönüş: (is_healthy: bool, reason: str)
+        """
+        info = get_wifi_interface_info()
+        if not info:
+            return True, "No WLAN NIC"
+        h, guid_bytes, desc = info
+        try:
+            guid_buf = (wintypes.BYTE * 16)(*guid_bytes)
+            # 1) Light keepalive scan tetikle (0.2 ms - kartı D0 uyanık tutar)
+            _wlanapi.WlanScan(h, ctypes.byref(guid_buf), None, None, None)
+            # 2) Mevcut görünür ağ sayısını kontrol et
+            p_net = ctypes.c_void_p()
+            ret = _wlanapi.WlanGetAvailableNetworkList(h, ctypes.byref(guid_buf), 0, None, ctypes.byref(p_net))
+            if ret != 0:
+                return False, f"Wi-Fi radyo sorgusu başarısız oldu (Hata: {ret})"
+            if not p_net:
+                return True, "OK"
+            net_list = ctypes.cast(p_net, ctypes.POINTER(_WLAN_AVAILABLE_NETWORK_LIST)).contents
+            count = net_list.dwNumberOfItems
+
+            if count > 0:
+                self._wifi_last_seen_networks = count
+                self._wifi_dead_streak = 0
+                return True, "OK"
+
+            # Eğer daha önce ağlar görünüyorken aniden 0'a düştüyse kart uykuya girmiş veya donmuş olabilir
+            if self._wifi_last_seen_networks > 0:
+                self._wifi_dead_streak += 1
+                if self._wifi_dead_streak >= 3:
+                    return False, f"Wi-Fi kartı radyo yayınını kaybetti ({self._wifi_last_seen_networks} ağdan 0'a düştü / RTD3 kilitlenmesi)"
+            return True, "OK"
+        finally:
+            _wlanapi.WlanCloseHandle(h, None)
+
     def _check_hotspot_health(self):
         """
         PowerShell çalıştırmadan (<10ms, 0 process) Hotspot'un gerçekten açık olduğunu,
         sanal adaptörün IP'sinin korunduğunu, icssvc + SharedAccess (ICS) servislerinin
-        çalıştığını ve internet paylaşımının (DNS/NAT) yanıt verdiğini doğrular.
+        çalıştığını, internet paylaşımının (DNS/NAT) yanıt verdiğini ve Wi-Fi radyo/güvenlik
+        motorunun kilitlenmediğini doğrular.
         Dönüş: (is_healthy: bool, needs_restart: bool, reason: str)
         """
         v_up, v_ip, v_name = self.get_hotspot_virtual_adapter()
@@ -777,6 +942,23 @@ class NetworkWorker:
             elif self._hotspot_sharing_failures > 0:
                 logging.info(f"Hotspot internet paylaşımı kendiliğinden normale döndü (Gateway: {v_ip}).")
             self._hotspot_sharing_failures = 0
+
+            # 1) Wi-Fi radyo keepalive (RTD3 uyku engelleme) ve canlılık kontrolü
+            radio_ok, radio_err = self._keepalive_and_check_wifi_radio()
+            if not radio_ok:
+                return False, True, radio_err
+
+            # 2) WLAN-AutoConfig logunda 'Wireless security stopped' (11004 / 8008) takılması kontrolü
+            now = time.time()
+            if check_wlan_security_event_stopped():
+                if self._hotspot_security_stopped_since is None:
+                    self._hotspot_security_stopped_since = now
+                elif now - self._hotspot_security_stopped_since >= 25:
+                    self._hotspot_security_stopped_since = None
+                    return False, True, "Wi-Fi Direct güvenlik motoru durdu (Event 11004 / WPA2 kilitlendi)"
+            else:
+                self._hotspot_security_stopped_since = None
+
             return True, False, "OK"
 
         # Ethernet'in kendisinde o an internet yoksa Hotspot'u suçlama
