@@ -18,7 +18,7 @@ from PIL import Image, ImageDraw, ImageTk
 import pystray
 from pystray import MenuItem as item
 
-APP_VERSION = "2026.11.04"
+APP_VERSION = "2026.11.05"
 
 # ==============================================================================
 # 1. WINDOWS IDENTITY
@@ -581,11 +581,15 @@ def check_wlan_security_event_stopped():
 class Config:
     def __init__(self):
         self.defaults = {
-            "adapter_name"  : "Ethernet",
-            "check_interval": 5,
-            "startup_delay" : 15,
-            "log_max_mb"    : DEFAULT_LOG_MAX_MB,
-            "auto_start"    : True,
+            "adapter_name"        : "Ethernet",
+            "check_interval"      : 5,
+            "startup_delay"       : 15,
+            "log_max_mb"          : DEFAULT_LOG_MAX_MB,
+            "auto_start"          : True,
+            "auto_ethernet_repair": True,
+            "wifi_sleep_guard"    : True,
+            "auto_hotspot_manage" : True,
+            "auto_wifi_recovery"  : True,
         }
         self.data = self.load()
 
@@ -603,8 +607,16 @@ class Config:
                         merged[key] = self.defaults[key]
                 if not isinstance(merged.get("adapter_name"), str) or not merged["adapter_name"].strip():
                     merged["adapter_name"] = self.defaults["adapter_name"]
-                if not isinstance(merged.get("auto_start"), bool):
-                    merged["auto_start"] = self.defaults["auto_start"]
+                bool_keys = (
+                    "auto_start",
+                    "auto_ethernet_repair",
+                    "wifi_sleep_guard",
+                    "auto_hotspot_manage",
+                    "auto_wifi_recovery",
+                )
+                for key in bool_keys:
+                    if not isinstance(merged.get(key), bool):
+                        merged[key] = self.defaults[key]
                 return merged
             except Exception:
                 return dict(self.defaults)
@@ -1024,13 +1036,15 @@ class NetworkWorker:
                 # Bağlantıyı asla kesme ve reset atma!
                 self._wifi_dead_streak = 0
                 self._hotspot_security_stopped_since = None
-                self._keepalive_and_check_wifi_radio()
+                if self.config.data.get("wifi_sleep_guard", True):
+                    self._keepalive_and_check_wifi_radio()
                 return True, False, "OK"
 
             # 1) Wi-Fi radyo keepalive (RTD3 uyku engelleme) ve canlılık kontrolü
-            radio_ok, radio_err = self._keepalive_and_check_wifi_radio()
-            if not radio_ok:
-                return False, True, radio_err
+            if self.config.data.get("wifi_sleep_guard", True):
+                radio_ok, radio_err = self._keepalive_and_check_wifi_radio()
+                if not radio_ok:
+                    return False, True, radio_err
 
             # 2) WLAN-AutoConfig logunda 'Wireless security stopped' (11004 / 8008) takılması kontrolü
             now = time.time()
@@ -1138,6 +1152,8 @@ class NetworkWorker:
         )
 
     def manage_hotspot(self, force=False):
+        if not force and not self.config.data.get("auto_hotspot_manage", True):
+            return
         now = time.time()
         adapters = enumerate_adapters()
         wifi = self.has_wifi_hardware(adapters=adapters)
@@ -1148,6 +1164,8 @@ class NetworkWorker:
                 self._hotspot_backoff_until = 0.0
             else:
                 logging.warning("Kullanılabilir Wi-Fi bağdaştırıcısı bulunamadı (devre dışı veya Kod 10 hatası). Hotspot atlandı.")
+                if self.config.data.get("auto_wifi_recovery", True):
+                    self.recover_wifi_hardware()
             self._wifi_hw_present = wifi
         if not wifi:
             return
@@ -1241,6 +1259,11 @@ class NetworkWorker:
             logging.info("Reset isteği atlandı: zaten bir reset işlemi yürütülüyor.")
             return
 
+        if not is_manual and not self.config.data.get("auto_ethernet_repair", True):
+            self._reset_lock.release()
+            logging.info("Otomatik Ethernet onarımı devre dışı (Auto Ethernet Repair = False); reset atlandı.")
+            return
+
         adapter = self.config.data["adapter_name"]
         trigger = "Manuel" if is_manual else "Otomatik"
         restored = False
@@ -1318,6 +1341,55 @@ class NetworkWorker:
             self._hotspot_last_check    = 0.0
             self._hotspot_backoff_until = 0.0
             self.manage_hotspot(force=True)
+
+    def get_wifi_adapter_name(self):
+        """Wi-Fi bağdaştırıcısının Windows arayüz adını döndürür."""
+        adapters = enumerate_adapters()
+        if adapters:
+            for a in adapters:
+                if a.get("if_type") == IF_TYPE_IEEE80211:
+                    return a.get("name")
+        return "Wi-Fi"
+
+    def recover_wifi_hardware(self):
+        """Wi-Fi bağdaştırıcısı devre dışı kaldığında veya kilitlendiğinde arayüzü yeniden açmayı dener."""
+        try:
+            wifi_name = self.get_wifi_adapter_name() or "Wi-Fi"
+            logging.warning(f"Otomatik Wi-Fi kurtarma devrede: '{wifi_name}' arayüzü etkinleştiriliyor...")
+            run_cmd(["netsh", "interface", "set", "interface", wifi_name, "enable"], timeout=self.NETSH_TIMEOUT, label="netsh-wifi-recover")
+        except Exception as e:
+            logging.error(f"Wi-Fi otomatik kurtarma başarısız: {e}")
+
+    def reset_wifi_adapter_logic(self):
+        """Wi-Fi adaptörünü güvenle devre dışı bırakıp tekrar etkinleştirir."""
+        if not self._reset_lock.acquire(blocking=False):
+            logging.info("Wi-Fi reset isteği atlandı: başka bir reset işlemi yürütülüyor.")
+            return
+        wifi_name = self.get_wifi_adapter_name() or "Wi-Fi"
+        try:
+            logging.warning(f"'{wifi_name}' Wi-Fi adaptörü manuel olarak yeniden başlatılıyor...")
+            run_cmd(["netsh", "interface", "set", "interface", wifi_name, "disable"], timeout=self.NETSH_TIMEOUT, label="netsh-wifi-disable")
+            time.sleep(2)
+            run_cmd(["netsh", "interface", "set", "interface", wifi_name, "enable"], timeout=self.NETSH_TIMEOUT, label="netsh-wifi-enable")
+            logging.info(f"'{wifi_name}' Wi-Fi adaptörü başarıyla yeniden başlatıldı.")
+            self._hotspot_last_check    = 0.0
+            self._hotspot_backoff_until = 0.0
+            self.manage_hotspot(force=True)
+        except Exception as e:
+            logging.error(f"Wi-Fi adaptör reset hatası: {e}")
+            try:
+                run_cmd(["netsh", "interface", "set", "interface", wifi_name, "enable"], timeout=self.NETSH_TIMEOUT, label="netsh-wifi-enable-recovery")
+            except Exception:
+                pass
+        finally:
+            self._reset_lock.release()
+
+    def restart_hotspot(self, reason="Kullanıcı manuel yeniden başlattı"):
+        """Mobil Etkin Noktayı (Hotspot) ve ICS internet paylaşım köprüsünü yeniden başlatır."""
+        self._hotspot_needs_restart = reason
+        self._hotspot_last_check    = 0.0
+        self._hotspot_backoff_until = 0.0
+        self.manage_hotspot(force=True)
 
     def _monitor_tick(self):
         if not self._active.is_set():
@@ -1432,6 +1504,7 @@ class ITUApp:
         self.window     = None
         self.icon_photo = None
         self.tray_img   = None
+        self._advanced_visible = False
 
         self.load_raw_assets()
 
@@ -1446,7 +1519,10 @@ class ITUApp:
             "ITU_Net", self.tray_img, "ITU Net Assistant",
             menu=pystray.Menu(
                 item("Open Dashboard", self._tray_open, default=True),
-                item("Force Reset", self._tray_force_reset),
+                pystray.Menu.SEPARATOR,
+                item("Restart Ethernet", self._tray_reset_eth),
+                item("Restart Wi-Fi", self._tray_reset_wifi),
+                item("Restart Hotspot", self._tray_restart_hotspot),
                 pystray.Menu.SEPARATOR,
                 item("Exit Program", self._tray_exit),
             )
@@ -1456,6 +1532,21 @@ class ITUApp:
     def _tray_open(self, *_):
         if self.window:
             self.window.after(0, self._bring_to_front)
+
+    def _tray_reset_eth(self, *_):
+        threading.Thread(
+            target=self.worker.reset_adapter_logic, args=(True,), daemon=True
+        ).start()
+
+    def _tray_reset_wifi(self, *_):
+        threading.Thread(
+            target=self.worker.reset_wifi_adapter_logic, daemon=True
+        ).start()
+
+    def _tray_restart_hotspot(self, *_):
+        threading.Thread(
+            target=self.worker.restart_hotspot, args=("Sistem tepsisi manuel reset",), daemon=True
+        ).start()
 
     def _tray_force_reset(self, *_):
         threading.Thread(
@@ -1526,7 +1617,8 @@ class ITUApp:
         ctk.set_appearance_mode("dark")
         self.window = ctk.CTk()
         self.window.title("ITU Net Assistant")
-        self.window.geometry("380x460")
+        self.window.geometry("390x510")
+        self.window.resizable(False, True)
         self.window.protocol("WM_DELETE_WINDOW", self.hide_dashboard)
 
         if os.path.exists(ICON_ICO_PATH):
@@ -1544,50 +1636,157 @@ class ITUApp:
 
         # --- UI ---
         ctk.CTkLabel(
-            self.window, text="DASHBOARD", font=("Arial", 22, "bold")
-        ).pack(pady=20)
+            self.window, text="DASHBOARD", font=("Arial", 18, "bold")
+        ).pack(pady=(12, 2))
 
         self.status_lbl = ctk.CTkLabel(
             self.window,
             text=f"Status: {self.worker.status.value}",
-            font=("Arial", 16, "bold"),
+            font=("Arial", 14, "bold"),
         )
-        self.status_lbl.pack(pady=10)
+        self.status_lbl.pack(pady=(0, 6))
 
+        # Ana Aç / Kapa Butonları
         self.btn_act = ctk.CTkButton(
-            self.window, text="ACTIVATE", fg_color="green", command=self.handle_act
+            self.window, text="ACTIVATE ALL", fg_color="green", hover_color="#2e7d32",
+            width=220, height=28, font=("Arial", 11, "bold"), command=self.handle_act
         )
-        self.btn_act.pack(pady=5)
+        self.btn_act.pack(pady=2)
 
         self.btn_deact = ctk.CTkButton(
-            self.window, text="DEACTIVATE", fg_color="#911", command=self.handle_deact
+            self.window, text="DEACTIVATE ALL", fg_color="#911", hover_color="#711",
+            width=220, height=28, font=("Arial", 11, "bold"), command=self.handle_deact
         )
-        self.btn_deact.pack(pady=5)
+        self.btn_deact.pack(pady=2)
 
+        # Manuel İşlemler
         ctk.CTkLabel(
-            self.window, text="--- Manual Actions ---", font=("Arial", 12)
-        ).pack(pady=15)
+            self.window, text="--- Manual Actions ---", font=("Arial", 11, "bold"), text_color="#aaa"
+        ).pack(pady=(8, 4))
+
+        self.btn_reset_eth = ctk.CTkButton(
+            self.window, text="Restart Ethernet Adapter", width=220, height=26, command=self.handle_reset_ethernet
+        )
+        self.btn_reset_eth.pack(pady=2)
+
+        self.btn_reset_wifi = ctk.CTkButton(
+            self.window, text="Restart Wi-Fi Adapter", width=220, height=26, command=self.handle_reset_wifi
+        )
+        self.btn_reset_wifi.pack(pady=2)
+
+        self.btn_restart_hotspot = ctk.CTkButton(
+            self.window, text="Restart Mobile Hotspot", width=220, height=26, command=self.handle_restart_hotspot
+        )
+        self.btn_restart_hotspot.pack(pady=2)
+
+        # Gelişmiş Modüller Toggle Butonu
+        self.btn_toggle_adv = ctk.CTkButton(
+            self.window, text="▼ Advanced Modules", width=220, height=26,
+            fg_color="#2b2d30", hover_color="#3c3f41", command=self.toggle_advanced
+        )
+        self.btn_toggle_adv.pack(pady=(8, 2))
+
+        # Gelişmiş Modüller Paneli (İlk başta pack edilmez)
+        self.adv_frame = ctk.CTkFrame(self.window, fg_color="#1e2022", corner_radius=8)
+        self._setup_advanced_modules(self.adv_frame)
+
+        # Alt Butonlar (Logs, Settings, Exit)
+        self.util_frame = ctk.CTkFrame(self.window, fg_color="transparent")
+        self.util_frame.pack(pady=(8, 2))
 
         ctk.CTkButton(
-            self.window, text="Force Adapter Reset", command=self.handle_reset
-        ).pack(pady=5)
+            self.util_frame, text="Open Logs", width=105, height=26,
+            fg_color="gray", hover_color="#666", command=self.handle_open_logs
+        ).pack(side="left", padx=5)
+
         ctk.CTkButton(
-            self.window, text="Open Logs", fg_color="gray",
-            command=self.handle_open_logs
-        ).pack(pady=5)
+            self.util_frame, text="Settings", width=105, height=26,
+            fg_color="#444", hover_color="#555", command=self.open_settings
+        ).pack(side="left", padx=5)
+
         ctk.CTkButton(
-            self.window, text="Settings", fg_color="#444", command=self.open_settings
-        ).pack(pady=5)
-        ctk.CTkButton(
-            self.window, text="Exit Program",
+            self.window, text="Exit Program", width=220, height=26,
             fg_color="#611", hover_color="#811", command=self.exit_app
-        ).pack(pady=(20, 5))
+        ).pack(pady=(2, 10))
 
         if silent:
             self.window.withdraw()
 
         self.update_ui_loop()
         self.window.mainloop()
+
+    def toggle_advanced(self):
+        self._advanced_visible = not self._advanced_visible
+        if self._advanced_visible:
+            self.adv_frame.pack(before=self.util_frame, fill="x", padx=18, pady=(4, 6))
+            self.btn_toggle_adv.configure(text="▲ Hide Advanced Modules")
+            self.window.geometry("390x770")
+        else:
+            self.adv_frame.pack_forget()
+            self.btn_toggle_adv.configure(text="▼ Advanced Modules")
+            self.window.geometry("390x510")
+
+    def _setup_advanced_modules(self, parent):
+        modules = [
+            (
+                "Auto Ethernet Repair",
+                "Ethernet kesildiğinde adaptörü otomatik onarır/resetler.",
+                "auto_ethernet_repair"
+            ),
+            (
+                "Wi-Fi D0 Sleep Guard",
+                "PCIe uyku modunu (RTD3) engelleyip kartı uyanık tutar.",
+                "wifi_sleep_guard"
+            ),
+            (
+                "Auto Hotspot Monitor",
+                "Hotspot'u açık tutar ve internet paylaşımını doğrular.",
+                "auto_hotspot_manage"
+            ),
+            (
+                "Auto Wi-Fi Recovery",
+                "Wi-Fi kartı donarsa veya Kod 10 verirse sürücüyü yeniler.",
+                "auto_wifi_recovery"
+            ),
+        ]
+
+        for title, desc, key in modules:
+            row = ctk.CTkFrame(parent, fg_color="transparent")
+            row.pack(fill="x", padx=10, pady=2)
+
+            var = ctk.BooleanVar(value=bool(self.config.data.get(key, True)))
+
+            def make_cmd(k, v):
+                return lambda: self._on_module_toggle(k, v)
+
+            sw = ctk.CTkSwitch(
+                row,
+                text=title,
+                font=("Arial", 11, "bold"),
+                width=40,
+                height=20,
+                variable=var,
+                command=make_cmd(key, var),
+            )
+            sw.pack(anchor="w")
+
+            lbl = ctk.CTkLabel(
+                row,
+                text=desc,
+                font=("Arial", 10),
+                text_color="#8c929c",
+                justify="left",
+            )
+            lbl.pack(anchor="w", padx=(32, 0), pady=(0, 1))
+
+    def _on_module_toggle(self, key, var):
+        val = var.get()
+        self.config.data[key] = val
+        try:
+            self.config.save()
+            logging.info(f"Modül ayarı güncellendi: '{key}' = {val}")
+        except Exception as e:
+            logging.error(f"Modül ayarı kaydedilemedi: {e}")
 
     def update_ui_loop(self):
         if not self.window:
@@ -1608,17 +1807,36 @@ class ITUApp:
     def handle_act(self):
         self.btn_act.configure(state="disabled", text="Activating...")
         self.worker.is_active = True
-        self.window.after(2000, lambda: self.btn_act.configure(state="normal", text="ACTIVATE"))
+        self.window.after(1500, lambda: self.btn_act.configure(state="normal", text="ACTIVATE ALL"))
 
     def handle_deact(self):
         self.btn_deact.configure(state="disabled", text="Deactivating...")
         self.worker.is_active = False
-        self.window.after(2000, lambda: self.btn_deact.configure(state="normal", text="DEACTIVATE"))
+        self.window.after(1500, lambda: self.btn_deact.configure(state="normal", text="DEACTIVATE ALL"))
 
-    def handle_reset(self):
+    def handle_reset_ethernet(self):
+        self.btn_reset_eth.configure(state="disabled", text="Resetting Ethernet...")
+        self.window.after(3000, lambda: self.btn_reset_eth.configure(state="normal", text="Restart Ethernet Adapter"))
         threading.Thread(
             target=self.worker.reset_adapter_logic, args=(True,), daemon=True
         ).start()
+
+    def handle_reset_wifi(self):
+        self.btn_reset_wifi.configure(state="disabled", text="Resetting Wi-Fi...")
+        self.window.after(3000, lambda: self.btn_reset_wifi.configure(state="normal", text="Restart Wi-Fi Adapter"))
+        threading.Thread(
+            target=self.worker.reset_wifi_adapter_logic, daemon=True
+        ).start()
+
+    def handle_restart_hotspot(self):
+        self.btn_restart_hotspot.configure(state="disabled", text="Restarting Hotspot...")
+        self.window.after(3000, lambda: self.btn_restart_hotspot.configure(state="normal", text="Restart Mobile Hotspot"))
+        threading.Thread(
+            target=self.worker.restart_hotspot, args=("Kullanıcı manuel yeniden başlattı",), daemon=True
+        ).start()
+
+    def handle_reset(self):
+        self.handle_reset_ethernet()
 
     def handle_open_logs(self):
         try:
