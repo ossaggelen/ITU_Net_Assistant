@@ -18,7 +18,7 @@ from PIL import Image, ImageDraw, ImageTk
 import pystray
 from pystray import MenuItem as item
 
-APP_VERSION = "2026.11.03.1"
+APP_VERSION = "2026.11.04"
 
 # ==============================================================================
 # 1. WINDOWS IDENTITY
@@ -496,10 +496,19 @@ class _WLAN_INTERFACE_INFO_LIST(ctypes.Structure):
         ("InterfaceInfo", _WLAN_INTERFACE_INFO * 1),
     ]
 
-class _WLAN_AVAILABLE_NETWORK_LIST(ctypes.Structure):
+WLAN_INTF_OPCODE_RADIO_STATE = 4
+
+class _WLAN_PHY_RADIO_STATE(ctypes.Structure):
     _fields_ = [
-        ("dwNumberOfItems", wintypes.DWORD),
-        ("dwIndex", wintypes.DWORD),
+        ("dwPhyIndex", wintypes.DWORD),
+        ("dot11SoftwareRadioState", wintypes.DWORD),
+        ("dot11HardwareRadioState", wintypes.DWORD),
+    ]
+
+class _WLAN_RADIO_STATE(ctypes.Structure):
+    _fields_ = [
+        ("dwNumberOfPhys", wintypes.DWORD),
+        ("PhyRadioState", _WLAN_PHY_RADIO_STATE * 64),
     ]
 
 def get_wifi_interface_info():
@@ -922,7 +931,9 @@ class NetworkWorker:
     def _keepalive_and_check_wifi_radio(self):
         """
         Wi-Fi PCIe kartını uyanık tutar (D0 keepalive / RTD3 uyku önleme) ve
-        radyo sürücüsünün C API'ye yanıt verip vermediğini test eder (~1-2 ms, 0 process).
+        radyo sürücüsünün donanım durumunu C API ile sorgular (~0.2 ms, 0 process).
+        ÖNEMLİ: WlanScan veya ağ taraması yapmaz; böylece Windows Konum (Location)
+        gizlilik iznini veya geçmişini asla tetiklemez.
         Dönüş: (is_healthy: bool, reason: str)
         """
         info = get_wifi_interface_info()
@@ -931,21 +942,40 @@ class NetworkWorker:
         h, guid_bytes, desc = info
         try:
             guid_buf = (wintypes.BYTE * 16)(*guid_bytes)
-            # 1) Light keepalive scan tetikle (0.2 ms - PCIe veriyolunu D0 uyanık tutar)
-            _wlanapi.WlanScan(h, ctypes.byref(guid_buf), None, None, None)
-            # 2) WLAN sürücüsünün yanıt verip vermediğini C API seviyesinde test et
-            p_net = ctypes.c_void_p()
-            ret = _wlanapi.WlanGetAvailableNetworkList(h, ctypes.byref(guid_buf), 0, None, ctypes.byref(p_net))
+            data_size = wintypes.DWORD()
+            p_data = ctypes.c_void_p()
+            opcode_type = wintypes.DWORD()
+
+            # WlanQueryInterface doğrudan sürücüye OID_DOT11_NIC_POWER_STATE sorgular,
+            # PCIe veriyolunu D0 uyanık tutar ve donanım çökmesini anında tespit eder.
+            # WlanScan gibi BSSID taramadığı için Windows Konum geçmişi oluşturmaz.
+            ret = _wlanapi.WlanQueryInterface(
+                h,
+                ctypes.byref(guid_buf),
+                WLAN_INTF_OPCODE_RADIO_STATE,
+                None,
+                ctypes.byref(data_size),
+                ctypes.byref(p_data),
+                ctypes.byref(opcode_type),
+            )
             if ret != 0:
                 self._wifi_dead_streak += 1
                 if self._wifi_dead_streak >= 3:
                     return False, f"Wi-Fi radyo sürücüsü yanıt vermiyor (C API Hata: {ret})"
                 return True, "Driver transient error"
-            if p_net:
+
+            if p_data:
                 try:
-                    _wlanapi.WlanFreeMemory(p_net)
-                except Exception:
-                    pass
+                    radio = ctypes.cast(p_data, ctypes.POINTER(_WLAN_RADIO_STATE)).contents
+                    phys = [radio.PhyRadioState[i] for i in range(min(radio.dwNumberOfPhys, 64))]
+                    if phys and all(p.dot11HardwareRadioState == 2 for p in phys):
+                        self._wifi_dead_streak += 1
+                        if self._wifi_dead_streak >= 3:
+                            return False, "Wi-Fi donanımsal radyo anahtarı kapalı (Hardware Radio Off)"
+                        return True, "Hardware radio off transient"
+                finally:
+                    _wlanapi.WlanFreeMemory(p_data)
+
             self._wifi_dead_streak = 0
             return True, "OK"
         except Exception:
