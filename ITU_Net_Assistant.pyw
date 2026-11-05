@@ -1505,6 +1505,7 @@ class ITUApp:
         self.icon_photo = None
         self.tray_img   = None
         self._advanced_visible = False
+        self._module_vars = {}
 
         self.load_raw_assets()
 
@@ -1617,8 +1618,8 @@ class ITUApp:
         ctk.set_appearance_mode("dark")
         self.window = ctk.CTk()
         self.window.title("ITU Net Assistant")
-        self.window.geometry("390x510")
-        self.window.resizable(False, True)
+        self.window.geometry("390x475")
+        self.window.resizable(False, False)
         self.window.protocol("WM_DELETE_WINDOW", self.hide_dashboard)
 
         if os.path.exists(ICON_ICO_PATH):
@@ -1659,36 +1660,37 @@ class ITUApp:
         )
         self.btn_deact.pack(pady=2)
 
-        # Manuel İşlemler
-        ctk.CTkLabel(
-            self.window, text="--- Manual Actions ---", font=("Arial", 11, "bold"), text_color="#aaa"
-        ).pack(pady=(8, 4))
-
-        self.btn_reset_eth = ctk.CTkButton(
-            self.window, text="Restart Ethernet Adapter", width=220, height=26, command=self.handle_reset_ethernet
-        )
-        self.btn_reset_eth.pack(pady=2)
-
-        self.btn_reset_wifi = ctk.CTkButton(
-            self.window, text="Restart Wi-Fi Adapter", width=220, height=26, command=self.handle_reset_wifi
-        )
-        self.btn_reset_wifi.pack(pady=2)
-
-        self.btn_restart_hotspot = ctk.CTkButton(
-            self.window, text="Restart Mobile Hotspot", width=220, height=26, command=self.handle_restart_hotspot
-        )
-        self.btn_restart_hotspot.pack(pady=2)
-
-        # Gelişmiş Modüller Toggle Butonu
+        # Gelişmiş Modüller Toggle Butonu (Kırmızı butonun hemen altında)
         self.btn_toggle_adv = ctk.CTkButton(
-            self.window, text="▼ Advanced Modules", width=220, height=26,
+            self.window, text="▼ Advanced", width=220, height=26,
             fg_color="#2b2d30", hover_color="#3c3f41", command=self.toggle_advanced
         )
-        self.btn_toggle_adv.pack(pady=(8, 2))
+        self.btn_toggle_adv.pack(pady=(4, 2))
 
         # Gelişmiş Modüller Paneli (İlk başta pack edilmez)
         self.adv_frame = ctk.CTkFrame(self.window, fg_color="#1e2022", corner_radius=8)
         self._setup_advanced_modules(self.adv_frame)
+
+        # Manuel İşlemler (Advanced'in altında)
+        self.lbl_manual = ctk.CTkLabel(
+            self.window, text="--- Manual Actions ---", font=("Arial", 11, "bold"), text_color="#aaa"
+        )
+        self.lbl_manual.pack(pady=(8, 4))
+
+        self.btn_reset_eth = ctk.CTkButton(
+            self.window, text="Restart Ethernet Adapter", width=190, height=26, command=self.handle_reset_ethernet
+        )
+        self.btn_reset_eth.pack(pady=2)
+
+        self.btn_reset_wifi = ctk.CTkButton(
+            self.window, text="Restart Wi-Fi Adapter", width=190, height=26, command=self.handle_reset_wifi
+        )
+        self.btn_reset_wifi.pack(pady=2)
+
+        self.btn_restart_hotspot = ctk.CTkButton(
+            self.window, text="Restart Mobile Hotspot", width=190, height=26, command=self.handle_restart_hotspot
+        )
+        self.btn_restart_hotspot.pack(pady=2)
 
         # Alt Butonlar (Logs, Settings, Exit)
         self.util_frame = ctk.CTkFrame(self.window, fg_color="transparent")
@@ -1707,7 +1709,7 @@ class ITUApp:
         ctk.CTkButton(
             self.window, text="Exit Program", width=220, height=26,
             fg_color="#611", hover_color="#811", command=self.exit_app
-        ).pack(pady=(2, 10))
+        ).pack(pady=(2, 6))
 
         if silent:
             self.window.withdraw()
@@ -1718,13 +1720,13 @@ class ITUApp:
     def toggle_advanced(self):
         self._advanced_visible = not self._advanced_visible
         if self._advanced_visible:
-            self.adv_frame.pack(before=self.util_frame, fill="x", padx=18, pady=(4, 6))
-            self.btn_toggle_adv.configure(text="▲ Hide Advanced Modules")
-            self.window.geometry("390x770")
+            self.adv_frame.pack(before=self.lbl_manual, fill="x", padx=18, pady=(4, 6))
+            self.btn_toggle_adv.configure(text="▲ Advanced")
+            self.window.geometry("390x750")
         else:
             self.adv_frame.pack_forget()
-            self.btn_toggle_adv.configure(text="▼ Advanced Modules")
-            self.window.geometry("390x510")
+            self.btn_toggle_adv.configure(text="▼ Advanced")
+            self.window.geometry("390x475")
 
     def _setup_advanced_modules(self, parent):
         modules = [
@@ -1755,6 +1757,7 @@ class ITUApp:
             row.pack(fill="x", padx=10, pady=2)
 
             var = ctk.BooleanVar(value=bool(self.config.data.get(key, True)))
+            self._module_vars[key] = var
 
             def make_cmd(k, v):
                 return lambda: self._on_module_toggle(k, v)
@@ -1788,52 +1791,105 @@ class ITUApp:
         except Exception as e:
             logging.error(f"Modül ayarı kaydedilemedi: {e}")
 
+        # Tüm modüller kapalıysa sistemi pasife al; en az biri açıksa aktif et
+        any_enabled = any(self.config.data.get(k, False) for k in ("auto_ethernet_repair", "wifi_sleep_guard", "auto_hotspot_manage", "auto_wifi_recovery"))
+        self.worker.is_active = any_enabled
+
     def update_ui_loop(self):
         if not self.window:
             return
-        status    = self.worker.status
-        color_map = {
-            Status.ACTIVE      : "green",
-            Status.RESETTING   : "orange",
-            Status.PASSIVE     : "gray",
-            Status.NO_CABLE    : "#d19a66",
-            Status.PAUSED      : "gray",
-            Status.INITIALIZING: "white",
-        }
-        color = color_map.get(status, "white")
-        self.status_lbl.configure(text=f"Status: {status.value}", text_color=color)
+        any_enabled = any(self.config.data.get(k, False) for k in ("auto_ethernet_repair", "wifi_sleep_guard", "auto_hotspot_manage", "auto_wifi_recovery"))
+        if not self.worker.is_active or not any_enabled:
+            status_text = "Status: Passive (All Modules Off)" if not any_enabled else "Status: Passive (Deactivated)"
+            self.status_lbl.configure(text=status_text, text_color="gray")
+        else:
+            status    = self.worker.status
+            color_map = {
+                Status.ACTIVE      : "green",
+                Status.RESETTING   : "orange",
+                Status.PASSIVE     : "gray",
+                Status.NO_CABLE    : "#d19a66",
+                Status.PAUSED      : "gray",
+                Status.INITIALIZING: "white",
+            }
+            color = color_map.get(status, "white")
+            self.status_lbl.configure(text=f"Status: {status.value}", text_color=color)
         self.window.after(1000, self.update_ui_loop)
 
+    def _set_actions_busy(self, busy, active_btn=None, busy_text=""):
+        buttons = [
+            self.btn_act,
+            self.btn_deact,
+            self.btn_reset_eth,
+            self.btn_reset_wifi,
+            self.btn_restart_hotspot,
+        ]
+        state = "disabled" if busy else "normal"
+        for b in buttons:
+            if b:
+                b.configure(state=state)
+        if busy and active_btn:
+            active_btn.configure(text=busy_text)
+
+    def _on_action_finished(self, btn, orig_text):
+        if btn:
+            btn.configure(text=orig_text)
+        self._set_actions_busy(False)
+
     def handle_act(self):
-        self.btn_act.configure(state="disabled", text="Activating...")
+        self._set_actions_busy(True, self.btn_act, "Activating...")
         self.worker.is_active = True
-        self.window.after(1500, lambda: self.btn_act.configure(state="normal", text="ACTIVATE ALL"))
+        for key, var in self._module_vars.items():
+            var.set(True)
+            self.config.data[key] = True
+        try:
+            self.config.save()
+        except Exception:
+            pass
+        self.window.after(800, lambda: self._on_action_finished(self.btn_act, "ACTIVATE ALL"))
 
     def handle_deact(self):
-        self.btn_deact.configure(state="disabled", text="Deactivating...")
+        self._set_actions_busy(True, self.btn_deact, "Deactivating...")
         self.worker.is_active = False
-        self.window.after(1500, lambda: self.btn_deact.configure(state="normal", text="DEACTIVATE ALL"))
+        for key, var in self._module_vars.items():
+            var.set(False)
+            self.config.data[key] = False
+        try:
+            self.config.save()
+        except Exception:
+            pass
+        self.window.after(800, lambda: self._on_action_finished(self.btn_deact, "DEACTIVATE ALL"))
 
     def handle_reset_ethernet(self):
-        self.btn_reset_eth.configure(state="disabled", text="Resetting Ethernet...")
-        self.window.after(3000, lambda: self.btn_reset_eth.configure(state="normal", text="Restart Ethernet Adapter"))
-        threading.Thread(
-            target=self.worker.reset_adapter_logic, args=(True,), daemon=True
-        ).start()
+        self._set_actions_busy(True, self.btn_reset_eth, "Resetting Ethernet...")
+        def work():
+            try:
+                self.worker.reset_adapter_logic(True)
+            finally:
+                if self.window:
+                    self.window.after(0, lambda: self._on_action_finished(self.btn_reset_eth, "Restart Ethernet Adapter"))
+        threading.Thread(target=work, daemon=True).start()
 
     def handle_reset_wifi(self):
-        self.btn_reset_wifi.configure(state="disabled", text="Resetting Wi-Fi...")
-        self.window.after(3000, lambda: self.btn_reset_wifi.configure(state="normal", text="Restart Wi-Fi Adapter"))
-        threading.Thread(
-            target=self.worker.reset_wifi_adapter_logic, daemon=True
-        ).start()
+        self._set_actions_busy(True, self.btn_reset_wifi, "Resetting Wi-Fi...")
+        def work():
+            try:
+                self.worker.reset_wifi_adapter_logic()
+            finally:
+                if self.window:
+                    self.window.after(0, lambda: self._on_action_finished(self.btn_reset_wifi, "Restart Wi-Fi Adapter"))
+        threading.Thread(target=work, daemon=True).start()
 
     def handle_restart_hotspot(self):
-        self.btn_restart_hotspot.configure(state="disabled", text="Restarting Hotspot...")
-        self.window.after(3000, lambda: self.btn_restart_hotspot.configure(state="normal", text="Restart Mobile Hotspot"))
-        threading.Thread(
-            target=self.worker.restart_hotspot, args=("Kullanıcı manuel yeniden başlattı",), daemon=True
-        ).start()
+        self._set_actions_busy(True, self.btn_restart_hotspot, "Restarting Hotspot...")
+        def work():
+            try:
+                self.worker.restart_hotspot("Kullanıcı manuel yeniden başlattı")
+                time.sleep(3)
+            finally:
+                if self.window:
+                    self.window.after(0, lambda: self._on_action_finished(self.btn_restart_hotspot, "Restart Mobile Hotspot"))
+        threading.Thread(target=work, daemon=True).start()
 
     def handle_reset(self):
         self.handle_reset_ethernet()
@@ -1849,6 +1905,21 @@ class ITUApp:
         win.title("Settings")
         win.geometry("320x420")
         win.attributes("-topmost", True)
+        if os.path.exists(ICON_ICO_PATH):
+            try:
+                ico_abs = os.path.abspath(ICON_ICO_PATH)
+                win._windows_set_titlebar_icon = lambda: win.iconbitmap(ico_abs)
+                win.iconbitmap(ico_abs)
+                win.after(250, lambda: win.iconbitmap(ico_abs))
+                win.after(600, lambda: win.iconbitmap(ico_abs))
+                win.update_idletasks()
+                hwnd = ctypes.windll.user32.GetParent(win.winfo_id()) or win.winfo_id()
+                hicon = ctypes.windll.user32.LoadImageW(None, ico_abs, 1, 0, 0, 0x10 | 0x40)
+                if hicon and hwnd:
+                    ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 0, hicon)
+                    ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 1, hicon)
+            except Exception:
+                pass
         if self.icon_photo:
             try:
                 win.wm_iconphoto(True, self.icon_photo)
