@@ -637,7 +637,7 @@ class NetworkWorker:
     HOTSPOT_ON_INTERVAL        = 15  # Hotspot 'On' iken sıfır-süreç (C-API + DNS soket) sağlık kontrol periyodu
     HOTSPOT_OFF_INTERVAL       = 10  # Hotspot kapalıyken veya bilinmiyorken kontrol periyodu
     HOTSPOT_RETRY_INTERVAL     = 10
-    HOTSPOT_MAX_BACKOFF        = 120
+    HOTSPOT_MAX_BACKOFF        = 1800  # Hata sürdükçe bekleme 30s,60s,120s... şeklinde artar, en fazla 30 dk
     HOTSPOT_SHARING_FAIL_LIMIT = 2   # Kaç ardışık paylaşım/DNS hatasında hotspot yeniden başlatılsın
 
     FAILS_BEFORE_RESET = 3
@@ -678,6 +678,13 @@ class NetworkWorker:
         self._hotspot_sharing_failures     = 0
         self._hotspot_dns_verified         = False
         self._hotspot_unverified_restarted = False
+        self._hotspot_transition_streak    = 0
+        self._hotspot_restart_streak       = 0
+        self._hotspot_last_restart_ok      = 0.0
+        self._hotspot_idle_since           = None
+        self._hotspot_idle_restarts        = 0
+        self._log_throttle                 = {}
+        self._last_tick_wall               = time.time()
         self._hotspot_virtual_ip           = None
         self._wifi_last_seen_networks      = -1
         self._wifi_dead_streak             = 0
@@ -734,7 +741,7 @@ class NetworkWorker:
         self._grace_until  = time.time() + self.POST_ACTION_GRACE
         self._grace_reason = reason
 
-    def get_adapter_info(self, adapter_name=None):
+    def get_adapter_info(self, adapter_name=None, adapters=None):
         """Donus: (is_up: bool, ip_address: str | None)"""
         if not adapter_name:
             adapter_name = self.config.data["adapter_name"]
@@ -742,7 +749,8 @@ class NetworkWorker:
         if not _iphlpapi:
             return True, None
 
-        adapters = enumerate_adapters()
+        if adapters is None:
+            adapters = enumerate_adapters()
         if adapters is None:
             return False, None
 
@@ -1036,6 +1044,8 @@ class NetworkWorker:
                 # Bağlantıyı asla kesme ve reset atma!
                 self._wifi_dead_streak = 0
                 self._hotspot_security_stopped_since = None
+                self._hotspot_idle_since    = None
+                self._hotspot_idle_restarts = 0
                 if self.config.data.get("wifi_sleep_guard", True):
                     self._keepalive_and_check_wifi_radio()
                 return True, False, "OK"
@@ -1045,6 +1055,19 @@ class NetworkWorker:
                 radio_ok, radio_err = self._keepalive_and_check_wifi_radio()
                 if not radio_ok:
                     return False, True, radio_err
+
+            # 1b) Sessiz bozulma koruması: Windows "On" diyor, IP/DNS sağlıklı ama uzun süredir hiç istemci yok.
+            #     İstemci olmadığı için yenilemek kimseyi kesmez; bekleme 5dk, 10dk, 20dk... (en fazla 4 saat) artar.
+            now_i = time.time()
+            if self._hotspot_idle_since is None:
+                self._hotspot_idle_since = now_i
+            else:
+                limit = min(5 * 60 * (2 ** self._hotspot_idle_restarts), 4 * 3600)
+                if now_i - self._hotspot_idle_since >= limit:
+                    mins = int((now_i - self._hotspot_idle_since) // 60)
+                    self._hotspot_idle_restarts += 1
+                    self._hotspot_idle_since = now_i
+                    return False, True, f"{mins} dakikadır hiç istemci bağlanmadı (sessiz bozulma ihtimaline karşı tazeleniyor)"
 
             # 2) WLAN-AutoConfig logunda 'Wireless security stopped' (11004 / 8008) takılması kontrolü
             now = time.time()
@@ -1151,11 +1174,49 @@ class NetworkWorker:
             timeout=45, label="ps-hotspot-manage",
         )
 
-    def manage_hotspot(self, force=False):
+    def _log_throttled(self, key, level, msg, every=300):
+        """Aynı mesajı her seferinde değil, en fazla `every` sn'de bir yazar (tekrar sayısıyla)."""
+        now = time.time()
+        last, cnt = self._log_throttle.get(key, (0.0, 0))
+        if now - last >= every:
+            extra = f" (son kayıttan beri {cnt} kez daha tekrarlandı)" if cnt else ""
+            logging.log(level, msg + extra)
+            self._log_throttle[key] = (now, 0)
+        else:
+            self._log_throttle[key] = (last, cnt + 1)
+
+    def _hotspot_backoff_delay(self, n, base=30):
+        """Ardışık n. hata için kademeli bekleme: 30s, 60s, 120s, 240s ... (üst sınır HOTSPOT_MAX_BACKOFF)."""
+        return min(base * (2 ** max(0, n - 1)), self.HOTSPOT_MAX_BACKOFF)
+
+    def _stop_hotspot_ps(self):
+        """Wi-Fi kartını kapatmadan önce Hotspot'u düzgünce durdurur (sürücü kilitlenmesini önlemek için)."""
+        ps_script = (
+            "$ErrorActionPreference = 'Stop'; "
+            "$cp = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType = WindowsRuntime]::GetInternetConnectionProfile(); "
+            "if (-not $cp) { exit 0 }; "
+            "$tm = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType = WindowsRuntime]::CreateFromConnectionProfile($cp); "
+            "if (-not $tm -or $tm.TetheringOperationalState.ToString() -ne 'On') { exit 0 }; "
+            "Add-Type -AssemblyName System.Runtime.WindowsRuntime; "
+            "$ext = [System.WindowsRuntimeSystemExtensions]; "
+            "$m = ($ext.GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]; "
+            "$m = $m.MakeGenericMethod([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult]); "
+            "$t = $m.Invoke($null, @($tm.StopTetheringAsync())); "
+            "[void]$t.Wait(15000); Start-Sleep -Milliseconds 1500"
+        )
+        try:
+            run_cmd(["powershell", "-NoLogo", "-NoProfile", "-NonInteractive",
+                     "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+                     "-Command", ps_script], timeout=25, label="ps-hotspot-stop")
+        except Exception as e:
+            logging.warning(f"Wi-Fi reset öncesi Hotspot durdurulamadı (devam ediliyor): {e}")
+
+    def manage_hotspot(self, force=False, adapters=None):
         if not force and not self.config.data.get("auto_hotspot_manage", True):
             return
         now = time.time()
-        adapters = enumerate_adapters()
+        if adapters is None:
+            adapters = enumerate_adapters()
         wifi = self.has_wifi_hardware(adapters=adapters)
         if wifi != self._wifi_hw_present:
             if wifi:
@@ -1199,6 +1260,8 @@ class NetworkWorker:
                     self._hotspot_last_state    = "On"
                     self._hotspot_failures      = 0
                     self._hotspot_backoff_until = 0.0
+                    if time.time() - self._hotspot_last_restart_ok > 180:
+                        self._hotspot_restart_streak = 0
                     return
 
                 if health_restart:
@@ -1209,7 +1272,7 @@ class NetworkWorker:
                     self._hotspot_last_state = "Off"
 
             if needs_restart:
-                logging.warning(f"Hotspot internet paylaşımı yenileniyor (Sebep: {restart_reason})...")
+                self._log_throttled("hs_restart", logging.WARNING, f"Hotspot internet paylaşımı yenileniyor (Sebep: {restart_reason})...", every=120)
 
             self._set_grace("hotspot başlatılıyor/yenileniyor")
             result = None
@@ -1222,6 +1285,7 @@ class NetworkWorker:
             out = (result.stdout or "") if result else ""
             if "STARTED" in out or "RESTARTED" in out:
                 self._hotspot_needs_restart        = None
+                self._hotspot_transition_streak    = 0
                 self._hotspot_failures             = 0
                 self._hotspot_backoff_until        = 0.0
                 self._hotspot_sharing_failures     = 0
@@ -1233,24 +1297,59 @@ class NetworkWorker:
                     logging.info("Mobil Etkin Nokta (Hotspot) ve ICS internet paylaşım köprüsü başarıyla yeniden başlatıldı.")
                 self._hotspot_last_state = "On"
                 self._hotspot_last_check = time.time()
+                # Başarılı restart sonrası kısa süre içinde yine sorun çıkarsa bekleme kademeli artsın
+                nowt = time.time()
+                if nowt - self._hotspot_last_restart_ok < 600:
+                    self._hotspot_restart_streak += 1
+                else:
+                    self._hotspot_restart_streak = 1
+                self._hotspot_last_restart_ok = nowt
+                if self._hotspot_restart_streak > 1:
+                    d = self._hotspot_backoff_delay(self._hotspot_restart_streak - 1)
+                    self._hotspot_backoff_until = nowt + d
+                    logging.warning(f"Hotspot kısa sürede tekrar bozuldu ({self._hotspot_restart_streak}. restart). Sonraki otomatik deneme en erken {d}s sonra.")
                 self._set_grace("hotspot başlatıldı")
             elif "IN_TRANSITION" in out:
                 self._hotspot_failures += 1
-                self._hotspot_backoff_until = time.time() + self.HOTSPOT_RETRY_INTERVAL
+                self._hotspot_transition_streak += 1
+                streak = self._hotspot_transition_streak
+                delay = self._hotspot_backoff_delay(self._hotspot_failures)
+                self._log_throttled("hs_transition", logging.WARNING, f"Hotspot 'InTransition' (geçiş) durumunda takılı ({streak}. deneme). Sonraki deneme {delay}s sonra.", every=120)
+                if streak == 3:
+                    logging.warning("Hotspot geçiş durumundan çıkamıyor -> icssvc / SharedAccess servisleri yeniden başlatılıyor...")
+                    self._recover_hotspot_services()
+                elif streak >= 6:
+                    self._hotspot_transition_streak = 0
+                    if self.config.data.get("auto_wifi_recovery", True):
+                        logging.warning("Servis yenileme yetmedi -> Wi-Fi adaptörü yeniden başlatılıyor (son çare)...")
+                        try:
+                            wname = self.get_wifi_adapter_name() or "Wi-Fi"
+                            self._stop_hotspot_ps()
+                            run_cmd(["netsh", "interface", "set", "interface", wname, "disable"], timeout=self.NETSH_TIMEOUT, label="netsh-wifi-disable-stuck")
+                            time.sleep(2)
+                            run_cmd(["netsh", "interface", "set", "interface", wname, "enable"], timeout=self.NETSH_TIMEOUT, label="netsh-wifi-enable-stuck")
+                        except Exception as e:
+                            logging.error(f"Wi-Fi son çare reset başarısız: {e}")
+                            try:
+                                run_cmd(["netsh", "interface", "set", "interface", self.get_wifi_adapter_name() or "Wi-Fi", "enable"], timeout=self.NETSH_TIMEOUT, label="netsh-wifi-enable-stuck-recovery")
+                            except Exception:
+                                pass
+                self._hotspot_backoff_until = time.time() + delay
             else:
                 self._hotspot_failures += 1
                 if self._hotspot_failures >= 2:
                     self._recover_hotspot_services()
-                delay = min(self.HOTSPOT_RETRY_INTERVAL * (2 ** (self._hotspot_failures - 1)), self.HOTSPOT_MAX_BACKOFF)
+                delay = self._hotspot_backoff_delay(self._hotspot_failures)
                 self._hotspot_backoff_until = time.time() + delay
                 err_msg = _one_line((result.stderr or result.stdout) if result else "Bilinmeyen hata")
-                logging.error(f"Mobil Etkin Nokta başlatılamadı ({err_msg}). {delay}s sonra tekrar denenecek.")
+                self._log_throttled("hs_start_fail", logging.ERROR, f"Mobil Etkin Nokta başlatılamadı ({err_msg[:200]}). {delay}s sonra tekrar denenecek.", every=120)
         except Exception as e:
             self._hotspot_failures += 1
             if self._hotspot_failures >= 2:
                 self._recover_hotspot_services()
-            self._hotspot_backoff_until = time.time() + self.HOTSPOT_RETRY_INTERVAL
-            logging.error(f"Hotspot işlemi sırasında hata: {e}")
+            delay = self._hotspot_backoff_delay(self._hotspot_failures)
+            self._hotspot_backoff_until = time.time() + delay
+            self._log_throttled("hs_exc", logging.ERROR, f"Hotspot işlemi sırasında hata: {e}. {delay}s sonra tekrar denenecek.", every=120)
         finally:
             self._hotspot_lock.release()
 
@@ -1368,6 +1467,7 @@ class NetworkWorker:
         wifi_name = self.get_wifi_adapter_name() or "Wi-Fi"
         try:
             logging.warning(f"'{wifi_name}' Wi-Fi adaptörü manuel olarak yeniden başlatılıyor...")
+            self._stop_hotspot_ps()
             run_cmd(["netsh", "interface", "set", "interface", wifi_name, "disable"], timeout=self.NETSH_TIMEOUT, label="netsh-wifi-disable")
             time.sleep(2)
             run_cmd(["netsh", "interface", "set", "interface", wifi_name, "enable"], timeout=self.NETSH_TIMEOUT, label="netsh-wifi-enable")
@@ -1403,7 +1503,8 @@ class NetworkWorker:
             return
 
         adapter = self.config.data["adapter_name"]
-        is_up, eth_ip = self.get_adapter_info(adapter)
+        adapters = enumerate_adapters() if _iphlpapi else None
+        is_up, eth_ip = self.get_adapter_info(adapter, adapters=adapters)
 
         if not is_up:
             self.status = Status.NO_CABLE
@@ -1434,7 +1535,7 @@ class NetworkWorker:
             if self._reset_streak and now - self._healthy_since >= self.STABLE_RESET_CLEAR:
                 self._reset_streak       = 0
                 self._next_reset_allowed = 0.0
-            self.manage_hotspot()
+            self.manage_hotspot(adapters=adapters)
             return
 
         # Baglanti yok
@@ -1449,7 +1550,10 @@ class NetworkWorker:
         self._consecutive_failures += 1
         n = self._consecutive_failures
         diag = self._diagnose_failure(adapter)
-        logging.warning(f"İnternet bağlantısı kurulamadı ({n}/{self.FAILS_BEFORE_RESET}). Durum: {diag}")
+        if n <= self.FAILS_BEFORE_RESET:
+            logging.warning(f"İnternet bağlantısı kurulamadı ({n}/{self.FAILS_BEFORE_RESET}). Durum: {diag}")
+        else:
+            self._log_throttled("eth_nofail", logging.WARNING, f"İnternet bağlantısı hala yok ({n}. ardışık başarısız kontrol). Durum: {diag}", every=120)
 
         if n < self.FAILS_BEFORE_RESET:
             return
@@ -1486,6 +1590,17 @@ class NetworkWorker:
 
         while self._running.is_set():
             try:
+                now_wall = time.time()
+                gap = now_wall - self._last_tick_wall
+                self._last_tick_wall = now_wall
+                if gap > max(40, self.config.data["check_interval"] * 4):
+                    logging.warning(f"Sistem uykudan/bekleme modundan döndü (~{int(gap)}s kesinti). Hotspot ve ağ durumu yeniden doğrulanacak.")
+                    self._hotspot_transition_streak = 0
+                    self._hotspot_failures          = 0
+                    self._hotspot_backoff_until     = 0.0
+                    self._hotspot_last_check        = 0.0
+                    self._hotspot_dns_verified      = False
+                    self._set_grace("uykudan dönüş")
                 self._monitor_tick()
             except Exception as e:
                 logging.exception(f"İzleme döngüsünde beklenmeyen hata: {e}")
@@ -1506,6 +1621,9 @@ class ITUApp:
         self.tray_img   = None
         self._advanced_visible = False
         self._module_vars = {}
+        self._ui_loop_id = None
+        self._last_ui_status = None
+        self._window_visible = False
 
         self.load_raw_assets()
 
@@ -1558,9 +1676,11 @@ class ITUApp:
         self.exit_app()
 
     def _bring_to_front(self):
+        self._window_visible = True
         self.window.deiconify()
         self.window.lift()
         self.window.focus_force()
+        self._start_ui_loop()
 
     def load_raw_assets(self):
         for path in [find_asset("icon.png"), find_asset("icon.ico")]:
@@ -1712,9 +1832,12 @@ class ITUApp:
         ).pack(pady=(2, 6))
 
         if silent:
+            self._window_visible = False
             self.window.withdraw()
+        else:
+            self._window_visible = True
+            self._ui_loop_id = self.window.after(100, self.update_ui_loop)
 
-        self.update_ui_loop()
         self.window.mainloop()
 
     def toggle_advanced(self):
@@ -1795,13 +1918,26 @@ class ITUApp:
         any_enabled = any(self.config.data.get(k, False) for k in ("auto_ethernet_repair", "wifi_sleep_guard", "auto_hotspot_manage", "auto_wifi_recovery"))
         self.worker.is_active = any_enabled
 
+    def _start_ui_loop(self):
+        self._stop_ui_loop()
+        self.update_ui_loop()
+
+    def _stop_ui_loop(self):
+        if self._ui_loop_id is not None and self.window:
+            try:
+                self.window.after_cancel(self._ui_loop_id)
+            except Exception:
+                pass
+            self._ui_loop_id = None
+
     def update_ui_loop(self):
-        if not self.window:
+        self._ui_loop_id = None
+        if not self.window or not self._window_visible:
             return
         any_enabled = any(self.config.data.get(k, False) for k in ("auto_ethernet_repair", "wifi_sleep_guard", "auto_hotspot_manage", "auto_wifi_recovery"))
         if not self.worker.is_active or not any_enabled:
             status_text = "Status: Passive (All Modules Off)" if not any_enabled else "Status: Passive (Deactivated)"
-            self.status_lbl.configure(text=status_text, text_color="gray")
+            color = "gray"
         else:
             status    = self.worker.status
             color_map = {
@@ -1812,9 +1948,13 @@ class ITUApp:
                 Status.PAUSED      : "gray",
                 Status.INITIALIZING: "white",
             }
+            status_text = f"Status: {status.value}"
             color = color_map.get(status, "white")
-            self.status_lbl.configure(text=f"Status: {status.value}", text_color=color)
-        self.window.after(1000, self.update_ui_loop)
+        new_state = (status_text, color)
+        if new_state != self._last_ui_status:
+            self.status_lbl.configure(text=status_text, text_color=color)
+            self._last_ui_status = new_state
+        self._ui_loop_id = self.window.after(1000, self.update_ui_loop)
 
     def _set_actions_busy(self, busy, active_btn=None, busy_text=""):
         buttons = [
@@ -1979,6 +2119,8 @@ class ITUApp:
         ctk.CTkButton(win, text="Save & Apply", command=save, fg_color="green").pack(pady=10)
 
     def hide_dashboard(self):
+        self._window_visible = False
+        self._stop_ui_loop()
         if self.window:
             self.window.withdraw()
 
